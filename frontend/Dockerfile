@@ -4,10 +4,9 @@ FROM oven/bun:1-alpine AS base
 FROM base AS builder
 WORKDIR /app
 
-# Copy manifests first for layer caching
+# Copy manifests + local packages before install (file: deps need their src at install time)
 COPY package.json bun.lock ./
-COPY packages/env/package.json packages/env/package.json
-COPY packages/ui/package.json packages/ui/package.json
+COPY packages/ packages/
 
 RUN bun install --frozen-lockfile
 
