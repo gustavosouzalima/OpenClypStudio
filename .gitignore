@@ -1,0 +1,67 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+.coverage
+htmlcov/
+
+# ── Env files ───────────────────────────────────────────
+.env
+.env.*
+!.env.*.example
+
+# ── Runtime data (databases, uploads, compilados) ──────
+.pixeltranscritor/
+backend/.pixeltranscritor/
+
+# ── IDE / Editor ────────────────────────────────────────
+.idea/
+.vscode/
+.cursor/
+
+# ── Claude / Aider (AI assistants) ─────────────────────
+.claude/
+.aider.conf.yml
+.aider.input.history
+.aider.tags.cache.v4/
+.aider.chat.history.md
+
+# ── Agents / Skills ────────────────────────────────────
+.agents/
+skills-lock.json
+
+# ── JS / TS artifacts ──────────────────────────────────
+*.tsbuildinfo
+.turbo/
+.next/
+node_modules/
+.bun-install/
+.bun-tmp/
+
+# ── OpenCut legacy (still present in repo) ─────────────
+OpenCut/.bun-install/
+OpenCut/.bun-tmp/
+OpenCut/.cursor/
+OpenCut/.vscode/
+OpenCut/node_modules/
+OpenCut/apps/web/.next/
+OpenCut/apps/web/.font-cache/
+OpenCut/apps/web/node_modules/
+
+# ── Legacy editor ───────────────────────────────────────
+editor/.bun-install/
+editor/.bun-tmp/
+editor/node_modules/
+editor/.next/
+
+# ── OS files ───────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,42 @@
+# Arquivo de variáveis: .env.openclyp  (copie de .env.openclyp.example)
+# Para subir: docker compose -f docker-compose.openclyp.yml --env-file .env.openclyp up -d --build
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PIXEL_HOST: "0.0.0.0"
+      PIXEL_PORT: "8000"
+      PIXEL_DATA_DIR: "/data"
+      PIXEL_LOG_LEVEL: "info"
+      # PIXEL_API_KEY: "troque-esta-chave"   # opcional: protege a API do backend
+    volumes:
+      - openclyp_data:/data
+    # Não exposto ao exterior — o frontend acessa internamente pela rede Docker
+    expose:
+      - "8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "4711:4711"
+    environment:
+      NODE_ENV: "production"
+      PORT: "4711"
+      NEXT_PUBLIC_SITE_URL: "${NEXT_PUBLIC_SITE_URL:-http://localhost:4711}"
+      # Aponta para o serviço backend dentro da rede Docker
+      NEXT_PUBLIC_PIXEL_API_BASE_URL: "http://backend:8000"
+      # ── Auth simples ──────────────────────────────────────────────────
+      SESSION_SECRET: "${SESSION_SECRET}"        # obrigatório
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD}"        # obrigatório
+    depends_on:
+      - backend
+
+volumes:
+  openclyp_data:

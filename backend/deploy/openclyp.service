@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenClyp Studio API
+After=network.target
+
+[Service]
+User=www-data
+WorkingDirectory=/opt/openclyp-studio
+Environment=PIXEL_HOST=127.0.0.1
+Environment=PIXEL_PORT=8000
+Environment=PIXEL_LOG_LEVEL=info
+Environment=PIXEL_LOG_FILE=/opt/openclyp-studio/logs/app.log
+Environment=PIXEL_LOG_MAX_BYTES=10485760
+Environment=PIXEL_LOG_BACKUP_COUNT=7
+# Environment=PIXEL_API_KEY=troque-esta-chave
+ExecStart=/opt/openclyp-studio/.venv/bin/python /opt/openclyp-studio/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

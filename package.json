@@ -1,0 +1,10 @@
+{
+  "name": "pixeltranscritor-workspace",
+  "private": true,
+  "scripts": {
+    "frontend:dev": "cd frontend && bun run dev --port 3000",
+    "frontend:build": "cd frontend && bun run build",
+    "backend:dev": "cd backend && python main.py",
+    "backend:test": "cd backend && python -m pytest -q"
+  }
+}
