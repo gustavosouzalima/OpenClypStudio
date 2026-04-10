@@ -49,7 +49,7 @@ services:
       backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:4711 > /dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4711/health > /dev/null || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
