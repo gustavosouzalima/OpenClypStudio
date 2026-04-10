@@ -319,6 +319,38 @@ def _build_wav_chunks(
     return chunks, temp_files
 
 
+def _transcribe_single_chunk(
+    batched,
+    chunk_path: str,
+    chunk_offset: float,
+    chunk_index: int,
+    language: str | None,
+    beam_size: int,
+    batch_size: int,
+) -> tuple[list, str | None]:
+    """Transcribe one audio chunk. Safe to call from a ThreadPoolExecutor."""
+    segments_gen, info = batched.transcribe(
+        chunk_path,
+        language=language,
+        beam_size=beam_size,
+        batch_size=batch_size,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),
+        condition_on_previous_text=False,
+    )
+    detected = getattr(info, "language", None)
+    segments = []
+    for seg in segments_gen:
+        segments.append(
+            SimpleNamespace(
+                text=seg.text,
+                start=chunk_offset + float(seg.start),
+                end=chunk_offset + float(seg.end),
+            )
+        )
+    return segments, detected
+
+
 def _transcribe_with_optional_chunking(
     *,
     batched,
@@ -333,6 +365,9 @@ def _transcribe_with_optional_chunking(
     progress_span: int = 100,
     log_fn=None,
 ) -> tuple[list, str | None, list[str]]:
+    import resource_tuner
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     if duration <= 0:
         duration = 1.0
 
@@ -351,74 +386,104 @@ def _transcribe_with_optional_chunking(
     else:
         chunks = [(audio_path, 0.0)]
 
-    segments_list: list = []
-    detected_language: str | None = None
-    last_pct = progress_start
-    covered_until = 0.0
-
-    def emit_progress(absolute_end: float) -> None:
-        nonlocal last_pct
-        if not progress_fn:
-            return
-        frac = max(0.0, min(absolute_end / duration, 1.0))
-        pct = min(progress_start + int(frac * max(progress_span, 1)), progress_start + progress_span)
-        if pct > last_pct:
-            progress_fn(pct)
-            last_pct = pct
-
-    for chunk_index, (chunk_path, chunk_offset) in enumerate(chunks):
-        if is_cancelled():
-            break
-
-        if log_fn and len(chunks) > 1:
-            log_fn(f"   Chunk {chunk_index + 1}/{len(chunks)}")
-
-        # Free memory from previous chunk before loading the next one.
-        if chunk_index > 0:
-            gc.collect()
-
+    # ── Single chunk: fast path (no thread pool overhead) ──
+    if len(chunks) == 1:
         if log_fn:
             log_fn(f"[mem] RSS before transcribe: {_rss_mb()}")
-            log_fn(f"   Transcribing chunk (beam={beam_size}, batch={batch_size})...")
-
-        segments_gen, info = batched.transcribe(
-            chunk_path,
-            language=language,
-            beam_size=beam_size,
-            batch_size=batch_size,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            condition_on_previous_text=False,
+            log_fn(f"   Transcribing (beam={beam_size}, batch={batch_size})...")
+        segs, detected = _transcribe_single_chunk(
+            batched, chunks[0][0], chunks[0][1], 0,
+            language, beam_size, batch_size,
         )
-        if detected_language is None:
-            detected_language = getattr(info, "language", None)
+        if progress_fn:
+            progress_fn(progress_start + progress_span)
+        return segs, detected, temp_chunk_files
 
-        for seg in segments_gen:
+    # ── Multiple chunks: parallel transcription ──
+    max_workers = resource_tuner.compute_parallel_chunks()
+    if log_fn:
+        log_fn(
+            f"[adaptive] {len(chunks)} chunks, processing {max_workers} in parallel "
+            f"(beam={beam_size}, batch={batch_size})"
+        )
+        log_fn(f"[mem] RSS before parallel transcribe: {_rss_mb()}")
+
+    # Results keyed by chunk_index for ordered merge
+    chunk_results: dict[int, tuple[list, str | None]] = {}
+    detected_language: str | None = None
+    completed_count = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {}
+        for chunk_index, (chunk_path, chunk_offset) in enumerate(chunks):
             if is_cancelled():
                 break
-
-            abs_start = chunk_offset + float(seg.start)
-            abs_end = chunk_offset + float(seg.end)
-
-            # Avoid duplicated segments caused by overlap between adjacent chunks.
-            if chunk_index > 0 and abs_end <= covered_until + 0.01:
-                continue
-
-            segments_list.append(
-                SimpleNamespace(
-                    text=seg.text,
-                    start=abs_start,
-                    end=abs_end,
-                )
+            future = pool.submit(
+                _transcribe_single_chunk,
+                batched, chunk_path, chunk_offset, chunk_index,
+                language, beam_size, batch_size,
             )
-            emit_progress(abs_end)
+            futures[future] = chunk_index
 
-        if len(chunks) > 1:
-            # Previous chunk effectively covers `chunk_seconds + overlap_seconds`
-            # from its own offset. Keep this absolute boundary so the next chunk
-            # does not duplicate tail segments.
-            nominal_chunk_end = min(duration, chunk_offset + float(chunk_seconds) + overlap_seconds)
-            covered_until = max(covered_until, nominal_chunk_end)
+        for future in as_completed(futures):
+            if is_cancelled():
+                # Cancel remaining futures
+                for f in futures:
+                    f.cancel()
+                break
+
+            chunk_idx = futures[future]
+            try:
+                segs, detected = future.result()
+                chunk_results[chunk_idx] = (segs, detected)
+            except Exception as exc:
+                if log_fn:
+                    log_fn(f"   Chunk {chunk_idx + 1} failed: {exc}")
+                chunk_results[chunk_idx] = ([], None)
+
+            completed_count += 1
+            if log_fn:
+                log_fn(f"   Chunk {chunk_idx + 1}/{len(chunks)} done ({len(chunk_results.get(chunk_idx, ([],))[0])} segs)")
+
+            # Check memory pressure and log it
+            if resource_tuner.check_memory_pressure() and log_fn:
+                log_fn(f"[mem] WARNING: memory pressure detected (RSS={_rss_mb()})")
+
+            # Emit progress based on completed fraction
+            if progress_fn:
+                frac = completed_count / len(chunks)
+                pct = min(
+                    progress_start + int(frac * max(progress_span, 1)),
+                    progress_start + progress_span,
+                )
+                progress_fn(pct)
+
+    # ── Merge results in chunk order with overlap dedup ──
+    segments_list: list = []
+    covered_until = 0.0
+
+    for chunk_index in range(len(chunks)):
+        result = chunk_results.get(chunk_index)
+        if result is None:
+            continue
+        segs, detected = result
+        if detected_language is None and detected:
+            detected_language = detected
+
+        _, chunk_offset = chunks[chunk_index]
+        for seg in segs:
+            # Deduplicate overlap region
+            if chunk_index > 0 and seg.end <= covered_until + 0.01:
+                continue
+            segments_list.append(seg)
+
+        if chunk_index < len(chunks) - 1:
+            nominal_end = min(duration, chunk_offset + float(chunk_seconds) + overlap_seconds)
+            covered_until = max(covered_until, nominal_end)
+
+    gc.collect()
+    if log_fn:
+        log_fn(f"[mem] RSS after parallel transcribe: {_rss_mb()}")
 
     return segments_list, detected_language, temp_chunk_files
 

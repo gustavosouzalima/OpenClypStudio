@@ -33,8 +33,11 @@ _batched_cache: dict = {}
 
 # Threads for CTranslate2 on CPU (0 = all available cores)
 _CPU_THREADS = int(os.getenv("PIXEL_CPU_THREADS", "0"))
-# Number of parallel workers for batched inference pipeline
-_NUM_WORKERS = int(os.getenv("PIXEL_NUM_WORKERS", "1"))
+# Number of parallel workers for CTranslate2 internal pool.
+# Must be >= number of concurrent transcribe() calls.
+# Auto-detected from PIXEL_MAX_PARALLEL_CHUNKS when set, otherwise defaults to
+# cpu_count to allow maximum parallelism.
+_NUM_WORKERS = int(os.getenv("PIXEL_NUM_WORKERS", "0")) or max(1, os.cpu_count() or 2)
 
 
 def get_whisper_model(model_size: str, log_fn=None):
