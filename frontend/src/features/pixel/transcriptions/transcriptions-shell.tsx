@@ -62,8 +62,8 @@ const LANGUAGES = [
 ];
 
 const BEAM_SIZES = [1, 2, 3, 5, 8, 10];
-const LOCAL_CHUNK_SECONDS = 75;
-const LOCAL_CHUNK_OVERLAP_SECONDS = 1;
+const LOCAL_CPU_CHUNK_SECONDS = 30;
+const LOCAL_CPU_CHUNK_OVERLAP_SECONDS = 0.5;
 const LOCAL_MAX_PARALLEL_WORKERS = 2;
 const LOCAL_SILENCE_RMS_THRESHOLD = 0.0025;
 const LOCAL_RMS_SAMPLE_CAP = 16000;
@@ -399,8 +399,8 @@ export function PixelTranscriptionsShell() {
     totalSamples: number;
     sampleRate: number;
   }): LocalChunkTask[] => {
-    const chunkSizeSamples = Math.max(1, Math.floor(LOCAL_CHUNK_SECONDS * sampleRate));
-    const overlapSamples = Math.max(0, Math.floor(LOCAL_CHUNK_OVERLAP_SECONDS * sampleRate));
+    const chunkSizeSamples = Math.max(1, Math.floor(LOCAL_CPU_CHUNK_SECONDS * sampleRate));
+    const overlapSamples = Math.max(0, Math.floor(LOCAL_CPU_CHUNK_OVERLAP_SECONDS * sampleRate));
     const chunks: LocalChunkTask[] = [];
 
     let startSample = 0;
@@ -413,7 +413,7 @@ export function PixelTranscriptionsShell() {
         startSample,
         endSample,
         startSeconds,
-        keepAfterSeconds: index === 0 ? 0 : startSeconds + LOCAL_CHUNK_OVERLAP_SECONDS,
+        keepAfterSeconds: index === 0 ? 0 : startSeconds + LOCAL_CPU_CHUNK_OVERLAP_SECONDS,
       });
       startSample += chunkSizeSamples;
       index += 1;
@@ -471,7 +471,7 @@ export function PixelTranscriptionsShell() {
     localServicesRef.current = services;
 
     appendLocalLog(
-      `[${fileName}] chunking: ${chunks.length} chunk(s), workers=${services.length}, chunk=${LOCAL_CHUNK_SECONDS}s overlap=${LOCAL_CHUNK_OVERLAP_SECONDS}s`,
+      `[${fileName}] chunking: ${chunks.length} chunk(s), workers=${services.length}, chunk=${LOCAL_CPU_CHUNK_SECONDS}s overlap=${LOCAL_CPU_CHUNK_OVERLAP_SECONDS}s`,
     );
 
     const chunkProgress = new Map<number, number>();
@@ -516,9 +516,10 @@ export function PixelTranscriptionsShell() {
             audioData: chunkAudio,
             language,
             modelId,
-            sampleRate,
-            devicePreference: engineLabel === "local-gpu" ? "webgpu" : "wasm",
-            onProgress: (progress) => {
+          sampleRate,
+          devicePreference: engineLabel === "local-gpu" ? "webgpu" : "wasm",
+          returnTimestamps: engineLabel === "local-gpu",
+          onProgress: (progress) => {
               const raw = Math.max(0, Math.min(100, progress.progress || 0));
             const current = chunkProgress.get(chunk.index) ?? 0;
             chunkProgress.set(chunk.index, Math.max(current, raw));
@@ -623,192 +624,58 @@ export function PixelTranscriptionsShell() {
     language: TranscriptionLanguage;
     onProgress: (progress: number) => void;
   }): Promise<{ text: string; segments: number }> => {
-    const isEmptyTokenIdsError = (error: unknown) =>
-      error instanceof Error &&
-      error.message.includes("token_ids must be a non-empty array of integers");
-
     const durationSeconds = samples.length / sampleRate;
     appendLocalLog(`[${fileName}] GPU transcription started (duration=${durationSeconds.toFixed(1)}s)`);
+    appendLocalLog(`[${fileName}] GPU mode: single pass with internal Whisper chunking (30s/5s)`);
 
-    if (durationSeconds <= 30) {
-      if (isLikelySilentChunk(samples)) {
-        appendLocalLog(`[${fileName}] GPU direct skipped (silence)`);
-        onProgress(100);
-        return { text: "", segments: 0 };
-      }
-
-      let highestProgress = 0;
-      let result;
-      try {
-        result = await service.transcribe({
-          audioData: samples,
-          language,
-          modelId,
-          sampleRate,
-          devicePreference: "webgpu",
-          returnTimestamps: true,
-          onProgress: (progress) => {
-            const raw = Math.max(0, Math.min(100, progress.progress || 0));
-            const normalized =
-              progress.status === "loading-model"
-                ? Math.floor(raw * 0.15)
-                : 15 + Math.floor(raw * 0.85);
-            highestProgress = Math.max(highestProgress, normalized);
-            onProgress(highestProgress);
-          },
-          onLog: (message) => {
-            if (
-              message.startsWith("worker:init-start") ||
-              message.startsWith("worker:init-complete") ||
-              message.startsWith("worker:transcribe-start") ||
-              message.startsWith("worker:transcribe-complete") ||
-              message.startsWith("transcribe:error")
-            ) {
-              appendLocalLog(`[${fileName}] ${message}`);
-            }
-          },
-        });
-      } catch (error) {
-        if (!isEmptyTokenIdsError(error)) {
-          throw error;
-        }
-        appendLocalLog(`[${fileName}] GPU direct fallback: empty-token-ids`);
-        onProgress(100);
-        return { text: "", segments: 0 };
-      }
+    if (isLikelySilentChunk(samples)) {
+      appendLocalLog(`[${fileName}] GPU direct skipped (silence)`);
       onProgress(100);
-      return { text: result.text, segments: result.segments.length };
+      return { text: "", segments: 0 };
     }
 
-    const chunks = buildLocalChunks({ totalSamples: samples.length, sampleRate });
-    appendLocalLog(
-      `[${fileName}] chunking: ${chunks.length} chunk(s), chunk=${LOCAL_CHUNK_SECONDS}s`,
-    );
-
-    const chunkProgress = new Map<number, number>();
-    const chunkResults = new Map<number, { text: string; segments: Array<{ text: string; start: number; end: number }> }>();
-    let meaningfulChunkCount = 0;
-    let emittedTextChunkCount = 0;
-    let lowInformationChunkCount = 0;
-    let accumulatedTextChars = 0;
-
-    const updateOverallProgress = () => {
-      let sum = 0;
-      for (const chunk of chunks) {
-        sum += chunkProgress.get(chunk.index) ?? 0;
-      }
-      onProgress(Math.floor(sum / chunks.length));
-    };
-
-    for (const chunk of chunks) {
-      if (localCancelledRef.current) throw new Error("Transcription was cancelled");
-
-      const chunkAudio = samples.subarray(chunk.startSample, chunk.endSample);
-      chunkProgress.set(chunk.index, 0);
-      appendLocalLog(`[${fileName}] GPU -> chunk ${chunk.index + 1}/${chunks.length}`);
-      if (isLikelySilentChunk(chunkAudio)) {
-        chunkResults.set(chunk.index, { text: "", segments: [] });
-        chunkProgress.set(chunk.index, 100);
-        appendLocalLog(`[${fileName}] chunk ${chunk.index + 1}/${chunks.length} skipped (silence)`);
-        updateOverallProgress();
-        continue;
-      }
-
-      let chunkHighest = 0;
-      let result;
-      try {
-        result = await service.transcribe({
-          audioData: chunkAudio,
-          language,
-          modelId,
-          sampleRate,
-          devicePreference: "webgpu",
-          returnTimestamps: true,
-          onProgress: (progress) => {
-            const raw = Math.max(0, Math.min(100, progress.progress || 0));
-            chunkHighest = Math.max(chunkHighest, raw);
-            chunkProgress.set(chunk.index, chunkHighest);
-            updateOverallProgress();
-          },
-          onLog: () => {},
-        });
-      } catch (error) {
-        if (!isEmptyTokenIdsError(error)) {
-          throw error;
+    let highestProgress = 0;
+    const result = await service.transcribe({
+      audioData: samples,
+      language,
+      modelId,
+      sampleRate,
+      devicePreference: "webgpu",
+      returnTimestamps: true,
+      onProgress: (progress) => {
+        const raw = Math.max(0, Math.min(100, progress.progress || 0));
+        const normalized =
+          progress.status === "loading-model"
+            ? Math.floor(raw * 0.15)
+            : 15 + Math.floor(raw * 0.85);
+        highestProgress = Math.max(highestProgress, normalized);
+        onProgress(highestProgress);
+      },
+      onLog: (message) => {
+        if (
+          message.startsWith("worker:init-start") ||
+          message.startsWith("worker:init-complete") ||
+          message.startsWith("worker:transcribe-start") ||
+          message.startsWith("worker:transcribe-running") ||
+          message.startsWith("worker:transcribe-complete") ||
+          message.startsWith("transcribe:error")
+        ) {
+          appendLocalLog(`[${fileName}] ${message}`);
         }
-        appendLocalLog(
-          `[${fileName}] chunk ${chunk.index + 1}/${chunks.length} fallback: empty-token-ids`,
-        );
-        chunkResults.set(chunk.index, { text: "", segments: [] });
-        chunkProgress.set(chunk.index, 100);
-        updateOverallProgress();
-        continue;
-      }
-
-      const shiftedSegments = result.segments.map((segment) => ({
-        text: segment.text,
-        start: segment.start + chunk.startSeconds,
-        end: segment.end + chunk.startSeconds,
-      }));
-
-      chunkResults.set(chunk.index, { text: result.text, segments: shiftedSegments });
-      chunkProgress.set(chunk.index, 100);
-      const chunkText = result.text.trim();
-      const chunkTextPreview = chunkText.slice(0, 80);
-      if (chunkText.length > 0) {
-        emittedTextChunkCount += 1;
-        accumulatedTextChars += chunkText.length;
-        if (isLowInformationTranscriptionText(chunkText)) {
-          lowInformationChunkCount += 1;
-        } else {
-          meaningfulChunkCount += 1;
-        }
-      }
-      appendLocalLog(
-        `[${fileName}] chunk ${chunk.index + 1}/${chunks.length} done (${shiftedSegments.length} segs${chunkTextPreview ? `, text="${chunkTextPreview}..."` : ", EMPTY"})`,
-      );
-      updateOverallProgress();
-    }
-
-    if (localCancelledRef.current) throw new Error("Transcription was cancelled");
-
-    const mergedSegments: Array<{ text: string; start: number; end: number }> = [];
-    const orderedChunkIndexes = [...chunkResults.keys()].sort((a, b) => a - b);
-    for (const chunkIndex of orderedChunkIndexes) {
-      const chunk = chunks[chunkIndex];
-      const chunkOutput = chunkResults.get(chunkIndex);
-      if (!chunkOutput) continue;
-      for (const segment of chunkOutput.segments) {
-        if (chunkIndex > 0 && segment.end <= chunk.keepAfterSeconds + 0.01) {
-          continue;
-        }
-        mergedSegments.push(segment);
-      }
-    }
-
-    const text = mergedSegments.map((segment) => segment.text.trim()).filter(Boolean).join(" ");
-    const minimumInformativeChunks = Math.max(2, Math.ceil(emittedTextChunkCount * 0.35));
-    const tooManyLowInformationChunks =
-      emittedTextChunkCount >= 4 &&
-      lowInformationChunkCount / Math.max(1, emittedTextChunkCount) >= 0.7;
+      },
+    });
+    const text = result.text.trim();
     const lowSignalGpuOutput =
-      chunks.length >= 4 &&
-      (
-        accumulatedTextChars < 24 ||
-        (emittedTextChunkCount >= 4 && meaningfulChunkCount < minimumInformativeChunks) ||
-        tooManyLowInformationChunks
-      );
+      !text ||
+      (text.length < 24 && result.segments.length <= 1) ||
+      isLowInformationTranscriptionText(text);
     if (lowSignalGpuOutput) {
-      appendLocalLog(
-        `[${fileName}] GPU low-information output detected (${meaningfulChunkCount}/${emittedTextChunkCount} informative chunks).`,
-      );
+      appendLocalLog(`[${fileName}] GPU low-information output detected.`);
       throw new Error("GPU_LOW_SIGNAL_OUTPUT");
     }
-    if (!text.trim()) {
-      appendLocalLog(`WARNING: GPU transcription produced empty text (${mergedSegments.length} segments). WebGPU may not be fully supported. Try CPU mode.`);
-    }
+    appendLocalLog(`[${fileName}] GPU pass done (${result.segments.length} segs)`);
     onProgress(100);
-    return { text, segments: mergedSegments.length };
+    return { text: result.text, segments: result.segments.length };
   };
 
   const startServerTranscription = async () => {
@@ -910,11 +777,8 @@ export function PixelTranscriptionsShell() {
           } catch (gpuError) {
             const gpuMessage =
               gpuError instanceof Error ? gpuError.message : String(gpuError);
-            if (gpuMessage !== "GPU_LOW_SIGNAL_OUTPUT") {
-              throw gpuError;
-            }
             appendLocalLog(
-              `[${file.name}] GPU output unreliable (mostly empty). Falling back to local CPU (${cpuFallbackModelId}).`,
+              `[${file.name}] GPU failed/unreliable (${gpuMessage}). Falling back to local CPU (${cpuFallbackModelId}).`,
             );
             perFileResult = await transcribeDecodedFileWithLocalWorkers({
               fileName: file.name,

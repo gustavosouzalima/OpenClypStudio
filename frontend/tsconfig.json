@@ -35,5 +35,9 @@
 		"src/stores/timeline-store.ts",
 		".next/dev/types/**/*.ts"
 	],
-	"exclude": ["node_modules"]
+	"exclude": [
+		"node_modules",
+		"whisper-web/**",
+		"whisper-web-experimental-webgpu/**"
+	]
 }

@@ -1,7 +1,8 @@
 import {
 	pipeline,
-	type AutomaticSpeechRecognitionPipeline,
+	WhisperTextStreamer,
 	type AutomaticSpeechRecognitionOutput,
+	type AutomaticSpeechRecognitionPipeline,
 } from "@huggingface/transformers";
 import type { TranscriptionSegment } from "@/types/transcription";
 import {
@@ -40,21 +41,21 @@ export type WorkerResponse =
 	| { type: "transcribe-error"; error: string }
 	| { type: "cancelled" };
 
+type StreamChunk = {
+	text: string;
+	offset: number;
+	timestamp: [number, number | null];
+	finalised: boolean;
+};
+
 let transcriber: AutomaticSpeechRecognitionPipeline | null = null;
-let cancelled: boolean = false;
+let cancelled = false;
 let lastReportedProgress = -1;
+let currentDevice: "webgpu" | "wasm" = "wasm";
+let currentModelHubId = "";
 const fileBytes = new Map<string, { loaded: number; total: number }>();
-const EMPTY_TOKEN_IDS_ERROR = "token_ids must be a non-empty array of integers";
 const SILENCE_RMS_THRESHOLD = 0.0025;
 const MAX_RMS_SAMPLES = 16000;
-
-function isEmptyTokenIdsError(error: unknown): boolean {
-	return (
-		error instanceof Error &&
-		typeof error.message === "string" &&
-		error.message.includes(EMPTY_TOKEN_IDS_ERROR)
-	);
-}
 
 function estimateRms(audio: Float32Array): number {
 	if (!audio.length) return 0;
@@ -69,18 +70,31 @@ function estimateRms(audio: Float32Array): number {
 	return count > 0 ? Math.sqrt(sumSquares / count) : 0;
 }
 
-function collectChunkText(result: AutomaticSpeechRecognitionOutput): string {
-	if (!Array.isArray(result.chunks) || result.chunks.length === 0) return "";
-	return result.chunks
-		.map((chunk) => (typeof chunk.text === "string" ? chunk.text.trim() : ""))
-		.filter(Boolean)
-		.join(" ");
-}
-
-function collectResultText(result: AutomaticSpeechRecognitionOutput): string {
-	const directText = typeof result.text === "string" ? result.text.trim() : "";
-	if (directText.length > 0) return directText;
-	return collectChunkText(result);
+function toSegmentsFromOutput(
+	output: AutomaticSpeechRecognitionOutput | null | undefined,
+	durationSeconds: number,
+): TranscriptionSegment[] {
+	const segments: TranscriptionSegment[] = [];
+	const rawChunks = (output as { chunks?: Array<Record<string, unknown>> } | null)?.chunks;
+	if (Array.isArray(rawChunks)) {
+		for (const chunk of rawChunks) {
+			const text = typeof chunk.text === "string" ? chunk.text : "";
+			const ts = chunk.timestamp;
+			if (!Array.isArray(ts) || ts.length < 2) continue;
+			const start = typeof ts[0] === "number" ? ts[0] : 0;
+			const end = typeof ts[1] === "number" ? ts[1] : start;
+			segments.push({ text, start, end });
+		}
+	}
+	const outputText = typeof output?.text === "string" ? output.text.trim() : "";
+	if (segments.length === 0 && outputText.length > 0) {
+		segments.push({
+			text: outputText,
+			start: 0,
+			end: durationSeconds,
+		});
+	}
+	return segments;
 }
 
 self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
@@ -115,13 +129,10 @@ async function handleInit({
 	modelId: string;
 	devicePreference?: "auto" | "webgpu" | "wasm";
 }) {
-	console.log("[worker] handleInit called with modelId:", modelId, "devicePreference:", devicePreference);
 	lastReportedProgress = -1;
 	fileBytes.clear();
 
 	try {
-		// Accept both internal ids (e.g. "whisper-small") and huggingFace ids
-		// (e.g. "onnx-community/whisper-small") for compatibility with callers.
 		const model =
 			TRANSCRIPTION_MODELS.find((m) => m.id === modelId) ??
 			TRANSCRIPTION_MODELS.find((m) => m.huggingFaceId === modelId);
@@ -135,22 +146,30 @@ async function handleInit({
 		if (devicePreference === "webgpu" && !hasWebGpu) {
 			throw new Error("WebGPU is not available in this browser/runtime.");
 		}
-		const device: "webgpu" | "wasm" =
+		currentDevice =
 			devicePreference === "wasm" ? "wasm" : hasWebGpu ? "webgpu" : "wasm";
+		currentModelHubId = model.huggingFaceId;
 
-		const dtype = device === "webgpu" ? "fp16" : "q4";
-
-		console.log("[worker] Loading model:", {
-			modelId: model.id,
-			modelName: model.name,
-			huggingFaceId: model.huggingFaceId,
-			device,
-			dtype,
-		});
+		const dtype = (
+			currentDevice === "webgpu"
+				? {
+						encoder_model:
+							model.huggingFaceId === "onnx-community/whisper-large-v3-turbo"
+								? "fp16"
+								: "fp32",
+						decoder_model_merged: "q4",
+					}
+				: "q4"
+		) as
+			| "q4"
+			| Record<
+					string,
+					"auto" | "fp16" | "fp32" | "q4" | "q8" | "int8" | "uint8" | "bnb4" | "q4f16"
+			  >;
 
 		transcriber = (await pipeline("automatic-speech-recognition", model.huggingFaceId, {
 			dtype,
-			device,
+			device: currentDevice,
 			progress_callback: (progressInfo: {
 				status?: string;
 				file?: string;
@@ -175,22 +194,17 @@ async function handleInit({
 					}
 				}
 
-				// sum all bytes
 				let totalLoaded = 0;
 				let totalSize = 0;
-				for (const { loaded, total } of fileBytes.values()) {
-					totalLoaded += loaded;
-					totalSize += total;
+				for (const value of fileBytes.values()) {
+					totalLoaded += value.loaded;
+					totalSize += value.total;
 				}
-
 				if (totalSize === 0) return;
 
-				const overallProgress = (totalLoaded / totalSize) * 100;
-				const roundedProgress = Math.floor(overallProgress);
-
+				const roundedProgress = Math.floor((totalLoaded / totalSize) * 100);
 				if (roundedProgress !== lastReportedProgress) {
 					lastReportedProgress = roundedProgress;
-					console.log(`[worker] Model loading progress: ${roundedProgress}%`);
 					self.postMessage({
 						type: "init-progress",
 						progress: roundedProgress,
@@ -199,10 +213,8 @@ async function handleInit({
 			},
 		})) as unknown as AutomaticSpeechRecognitionPipeline;
 
-		console.log("[worker] Model loaded successfully");
 		self.postMessage({ type: "init-complete" } satisfies WorkerResponse);
 	} catch (error) {
-		console.error("[worker] Model initialization failed:", error);
 		self.postMessage({
 			type: "init-error",
 			error: error instanceof Error ? error.message : `Failed to load model ${modelId}: ${error}`,
@@ -221,12 +233,6 @@ async function handleTranscribe({
 	sampleRate?: number;
 	returnTimestamps?: boolean;
 }) {
-	console.log("[worker] handleTranscribe called:", {
-		audioLength: audio.length,
-		language,
-		sampleRate,
-	});
-
 	if (!transcriber) {
 		self.postMessage({
 			type: "transcribe-error",
@@ -292,130 +298,83 @@ async function handleTranscribe({
 			}
 		}, 1200);
 
-		console.log("[worker] Starting transcription with Whisper pipeline...");
-		const inferenceChunkLength = returnTimestamps
-			? DEFAULT_CHUNK_LENGTH_SECONDS
-			: Math.max(DEFAULT_CHUNK_LENGTH_SECONDS, 60);
-		const inferenceStride = returnTimestamps
-			? DEFAULT_STRIDE_SECONDS
-			: Math.min(DEFAULT_STRIDE_SECONDS, 2);
-
-		const pipelineOpts: Record<string, unknown> = {
-			chunk_length_s: inferenceChunkLength,
-			stride_length_s: inferenceStride,
-			return_timestamps: returnTimestamps,
+		const requestedLanguage = language && language !== "auto" ? language : undefined;
+		const task = "transcribe";
+		const isDistilWhisper = currentModelHubId.includes("/distil-");
+		const chunkLengthSeconds = isDistilWhisper ? 20 : DEFAULT_CHUNK_LENGTH_SECONDS;
+		const strideSeconds = isDistilWhisper ? 3 : DEFAULT_STRIDE_SECONDS;
+		const anyTranscriber = transcriber as unknown as {
+			processor?: {
+				feature_extractor?: { config?: { chunk_length?: number } };
+			};
+			model?: { config?: { max_source_positions?: number } };
+			tokenizer?: unknown;
 		};
+		const numerator = anyTranscriber.processor?.feature_extractor?.config?.chunk_length ?? 0;
+		const denominator = anyTranscriber.model?.config?.max_source_positions ?? 0;
+		const timePrecision = numerator > 0 && denominator > 0 ? numerator / denominator : 0.02;
+		const streamedChunks: StreamChunk[] = [];
+		let chunkCount = 0;
+		let startTime: number | null = null;
+		let numTokens = 0;
+		let tps = 0;
 
-		if (language && language !== "auto") {
-			pipelineOpts.language = language;
-		} else {
-			pipelineOpts.task = "transcribe";
-		}
+		const streamer =
+			currentDevice === "webgpu" && returnTimestamps
+				? new WhisperTextStreamer(anyTranscriber.tokenizer as never, {
+						time_precision: timePrecision,
+						on_chunk_start: (x: number) => {
+							const offset = (chunkLengthSeconds - strideSeconds) * chunkCount;
+							streamedChunks.push({
+								text: "",
+								timestamp: [offset + x, null],
+								finalised: false,
+								offset,
+							});
+						},
+						token_callback_function: () => {
+							startTime ??= performance.now();
+							if (numTokens++ > 0 && startTime !== null) {
+								tps = (numTokens / (performance.now() - startTime)) * 1000;
+							}
+						},
+						callback_function: (x: string) => {
+							if (streamedChunks.length === 0) return;
+							const current = streamedChunks[streamedChunks.length - 1];
+							current.text += x;
+						},
+						on_chunk_end: (x: number) => {
+							const current = streamedChunks[streamedChunks.length - 1];
+							if (!current) return;
+							current.timestamp[1] = x + current.offset;
+							current.finalised = true;
+						},
+						on_finalize: () => {
+							startTime = null;
+							numTokens = 0;
+							chunkCount += 1;
+						},
+					} as never)
+				: null;
 
-		let rawResult: AutomaticSpeechRecognitionOutput | AutomaticSpeechRecognitionOutput[];
-		try {
-			rawResult = await transcriber(audio, pipelineOpts);
-		} catch (firstError) {
-			if (!isEmptyTokenIdsError(firstError)) {
-				throw firstError;
-			}
+		const rawOutput = await transcriber(audio, {
+			top_k: 0,
+			do_sample: false,
+			chunk_length_s: chunkLengthSeconds,
+			stride_length_s: strideSeconds,
+			language: requestedLanguage,
+			task,
+			return_timestamps: returnTimestamps,
+			force_full_sequences: false,
+			...(streamer ? { streamer } : {}),
+		});
 
-			self.postMessage({
-				type: "log",
-				message: "worker:empty-token-ids retry-without-timestamps",
-			} satisfies WorkerResponse);
-
-			// Some WebGPU runs fail on timestamp decoding for near-silent chunks.
-			// Retry without timestamps to salvage plain text when possible.
-			try {
-				rawResult = await transcriber(audio, {
-					...pipelineOpts,
-					return_timestamps: false,
-					chunk_length_s: Math.max(inferenceChunkLength, 60),
-					stride_length_s: Math.min(inferenceStride, 2),
-				});
-			} catch (retryError) {
-				if (!isEmptyTokenIdsError(retryError)) {
-					throw retryError;
-				}
-
-				if (timer) {
-					self.clearInterval(timer);
-					timer = null;
-				}
-
-				self.postMessage({
-					type: "log",
-					message: "worker:empty-token-ids fallback-empty-chunk",
-				} satisfies WorkerResponse);
-				self.postMessage({
-					type: "transcribe-progress",
-					progress: 100,
-				} satisfies WorkerResponse);
-				self.postMessage({
-					type: "transcribe-complete",
-					text: "",
-					segments: [],
-					language: null,
-				} satisfies WorkerResponse);
-				return;
-			}
-		}
 		if (timer) {
 			self.clearInterval(timer);
 			timer = null;
 		}
 
-		let result: AutomaticSpeechRecognitionOutput = Array.isArray(rawResult)
-			? rawResult[0]
-			: rawResult;
-
-		if (returnTimestamps && collectResultText(result).length === 0) {
-			self.postMessage({
-				type: "log",
-				message: "worker:empty-text retry-without-timestamps",
-			} satisfies WorkerResponse);
-			try {
-				const retryRaw = await transcriber(audio, {
-					...pipelineOpts,
-					return_timestamps: false,
-					chunk_length_s: Math.max(inferenceChunkLength, 60),
-					stride_length_s: Math.min(inferenceStride, 2),
-				});
-				const retryResult: AutomaticSpeechRecognitionOutput = Array.isArray(retryRaw)
-					? retryRaw[0]
-					: retryRaw;
-				if (collectResultText(retryResult).length > 0) {
-					rawResult = retryRaw;
-					result = retryResult;
-					self.postMessage({
-						type: "log",
-						message: "worker:empty-text retry-succeeded",
-					} satisfies WorkerResponse);
-				} else {
-					self.postMessage({
-						type: "log",
-						message: "worker:empty-text retry-still-empty",
-					} satisfies WorkerResponse);
-				}
-			} catch (retryError) {
-				self.postMessage({
-					type: "log",
-					message: `worker:empty-text retry-failed ${retryError instanceof Error ? retryError.message : "unknown error"}`,
-				} satisfies WorkerResponse);
-			}
-		}
-
-		console.log("[worker] Transcription raw result:", {
-			type: typeof rawResult,
-			isArray: Array.isArray(rawResult),
-			hasChunks: !!result?.chunks,
-			chunksCount: result?.chunks?.length || 0,
-			textLength: result?.text?.length || 0,
-		});
-
 		if (cancelled) {
-			console.log("[worker] Transcription cancelled");
 			self.postMessage({
 				type: "log",
 				message: "worker:transcribe-cancelled",
@@ -423,58 +382,47 @@ async function handleTranscribe({
 			return;
 		}
 
-		console.log("[worker] Processing transcription result:", {
-			hasTimestamps: !!result.chunks?.[0]?.timestamp,
-			timestampsLength: result.chunks?.[0]?.timestamp?.length || 0,
-			textLength: result.text?.length || 0,
-		});
+		const output = (Array.isArray(rawOutput) ? rawOutput[0] : rawOutput) as AutomaticSpeechRecognitionOutput;
+		const outputText = typeof output?.text === "string" ? output.text.trim() : "";
+		const streamedText = streamedChunks.map((chunk) => chunk.text).join("").trim();
+		const finalText = outputText || streamedText;
 
-		const segments: TranscriptionSegment[] = [];
-
-		if (result.chunks) {
-			for (const chunk of result.chunks) {
-				if (chunk.timestamp && chunk.timestamp.length >= 2) {
-					segments.push({
-						text: chunk.text,
-						start: chunk.timestamp[0] ?? 0,
-						end: chunk.timestamp[1] ?? chunk.timestamp[0] ?? 0,
-					});
-				}
-			}
-		} else {
-			console.warn("[worker] No timestamp chunks found in result, trying to extract text-based segments");
+		let segments = toSegmentsFromOutput(output, durationSeconds);
+		if (segments.length === 0 && streamedChunks.length > 0) {
+			segments = streamedChunks
+				.filter((chunk) => chunk.text.trim().length > 0)
+				.map((chunk) => ({
+					text: chunk.text,
+					start: chunk.timestamp[0] ?? 0,
+					end: chunk.timestamp[1] ?? chunk.timestamp[0] ?? durationSeconds,
+				}));
 		}
-
-		console.log("[worker] Generated segments:", {
-			segmentsCount: segments.length,
-		segments,
-		});
-
-		const finalText = collectResultText(result);
-
 		if (segments.length === 0 && finalText.length > 0) {
-			segments.push({
-				text: finalText,
-				start: 0,
-				end: durationSeconds,
-			});
+			segments = [
+				{
+					text: finalText,
+					start: 0,
+					end: durationSeconds,
+				},
+			];
 		}
+
 		self.postMessage({
 			type: "transcribe-progress",
 			progress: 100,
 		} satisfies WorkerResponse);
 		self.postMessage({
 			type: "log",
-			message: `worker:transcribe-complete segments=${segments.length}`,
+			message: `worker:transcribe-complete segments=${segments.length} tps=${tps.toFixed(2)}`,
 		} satisfies WorkerResponse);
-
 		self.postMessage({
 			type: "transcribe-complete",
 			text: finalText,
 			segments,
-			language: typeof (rawResult as Record<string, unknown>)?.language === "string"
-				? (rawResult as Record<string, unknown>).language as string
-				: null,
+			language:
+				typeof (rawOutput as Record<string, unknown>)?.language === "string"
+					? ((rawOutput as Record<string, unknown>).language as string)
+					: null,
 		} satisfies WorkerResponse);
 	} catch (error) {
 		if (timer) {
@@ -482,7 +430,7 @@ async function handleTranscribe({
 			timer = null;
 		}
 		if (cancelled) return;
-		console.error("[worker] Transcription failed:", error);
+
 		self.postMessage({
 			type: "log",
 			message: `worker:transcribe-failed ${error instanceof Error ? error.message : "unknown error"}`,
