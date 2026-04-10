@@ -176,6 +176,12 @@ COMPILADOS_DIR.mkdir(parents=True, exist_ok=True)
 TRANSCRIBE_CHUNK_SECONDS = max(0, int(os.getenv("PIXEL_TRANSCRIBE_CHUNK_SECONDS", "120")))
 TRANSCRIBE_CHUNK_OVERLAP_SECONDS = max(0.0, float(os.getenv("PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS", "1.0")))
 
+logger.info(
+    "Transcription config: chunk=%ds, overlap=%.1fs",
+    TRANSCRIBE_CHUNK_SECONDS,
+    TRANSCRIBE_CHUNK_OVERLAP_SECONDS,
+)
+
 
 def _is_path_within_dir(path: Path, parent_dir: Path) -> bool:
     try:
@@ -208,6 +214,15 @@ TRANSCRIBE_MAX_BATCH_SIZE_GPU = _env_int("PIXEL_MAX_BATCH_SIZE_GPU", 32, min_val
 TRANSCRIBE_FORCE_CPU_SAFE_MODEL = _env_bool("PIXEL_FORCE_CPU_SAFE_MODEL", True)
 TRANSCRIBE_CPU_SAFE_MODEL = os.getenv("PIXEL_CPU_SAFE_MODEL", "medium").strip() or "medium"
 CPU_HEAVY_WHISPER_MODELS = {"large", "large-v1", "large-v2", "large-v3", "large-v3-turbo"}
+
+logger.info(
+    "Transcription defaults: model=%s, batch=%d, max_batch_cpu=%d, force_cpu_safe=%s, cpu_safe_model=%s",
+    DEFAULT_TRANSCRIBE_MODEL,
+    DEFAULT_TRANSCRIBE_BATCH_SIZE,
+    TRANSCRIBE_MAX_BATCH_SIZE_CPU,
+    TRANSCRIBE_FORCE_CPU_SAFE_MODEL,
+    TRANSCRIBE_CPU_SAFE_MODEL,
+)
 
 
 def _resolve_transcribe_runtime(
@@ -359,6 +374,10 @@ def _transcribe_with_optional_chunking(
         # Free memory from previous chunk before loading the next one.
         if chunk_index > 0:
             gc.collect()
+
+        if log_fn:
+            log_fn(f"[mem] RSS before transcribe: {_rss_mb()}")
+            log_fn(f"   Transcribing chunk (beam={beam_size}, batch={batch_size})...")
 
         segments_gen, info = batched.transcribe(
             chunk_path,
@@ -1616,9 +1635,11 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
         model_name, effective_batch_size = _resolve_transcribe_runtime(req.model, req.batch_size, log)
         language = None if req.language == "auto" else req.language
 
+        log(f"Loading Whisper model '{model_name}' (batch={effective_batch_size}, chunk={TRANSCRIBE_CHUNK_SECONDS}s)...")
         _, batched = tr_module.get_whisper_model(model_name, log)
         if not batched:
             raise RuntimeError("Failed to load Whisper model.")
+        log(f"[mem] RSS after model load: {_rss_mb()}")
 
         for file_index, original_path in enumerate(req.files):
             if _jobs[job_id].get("cancelled"):
@@ -1817,12 +1838,13 @@ def _run_transcribe_url(job_id: str, req: TranscribeUrlRequest, loop: asyncio.Ab
         language = None if req.language == "auto" else req.language
         model_name, effective_batch_size = _resolve_transcribe_runtime(req.model, req.batch_size, log)
 
-        log(f"🎤 Transcribing (model={model_name}, beam={req.beam_size})...")
+        log(f"🎤 Loading model '{model_name}' (batch={effective_batch_size}, chunk={TRANSCRIBE_CHUNK_SECONDS}s)...")
         progress(30)
 
         _, batched = tr_module.get_whisper_model(model_name, log)
         if not batched:
             raise RuntimeError("Failed to load Whisper model.")
+        log(f"[mem] RSS after model load: {_rss_mb()}")
 
         segments_list, detected_language, chunk_temp_files = _transcribe_with_optional_chunking(
             batched=batched,

@@ -13,6 +13,14 @@ services:
       PIXEL_DATA_DIR: "/data"
       PIXEL_LOG_LEVEL: "info"
       PIXEL_API_KEY: "${PIXEL_API_KEY}"
+      # ── Transcription tuning (override via .env.openclyp) ──
+      PIXEL_DEFAULT_WHISPER_MODEL: "${PIXEL_DEFAULT_WHISPER_MODEL:-small}"
+      PIXEL_DEFAULT_BATCH_SIZE: "${PIXEL_DEFAULT_BATCH_SIZE:-4}"
+      PIXEL_MAX_BATCH_SIZE_CPU: "${PIXEL_MAX_BATCH_SIZE_CPU:-4}"
+      PIXEL_FORCE_CPU_SAFE_MODEL: "${PIXEL_FORCE_CPU_SAFE_MODEL:-true}"
+      PIXEL_CPU_SAFE_MODEL: "${PIXEL_CPU_SAFE_MODEL:-small}"
+      PIXEL_TRANSCRIBE_CHUNK_SECONDS: "${PIXEL_TRANSCRIBE_CHUNK_SECONDS:-120}"
+      PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS: "${PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS:-1.0}"
     volumes:
       - openclyp_data:/data
     expose:
@@ -26,7 +34,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 10G
           cpus: "2"
 
   frontend:
