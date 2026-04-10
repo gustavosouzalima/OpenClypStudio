@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { motion } from "motion/react";
 import { Button } from "./ui/button";
-import { ArrowRight, LogOut } from "lucide-react";
+import { ArrowRight, LogOut, Cpu, Zap } from "lucide-react";
 import Image from "next/image";
 import { ThemeToggle } from "./theme-toggle";
 import {
@@ -24,6 +24,7 @@ import {
   ContextMenuItem,
   ContextMenuTrigger,
 } from "./ui/context-menu";
+import { pixelApi } from "@/integrations/pixel/api";
 
 const HEADER_LOGO_URL = "/logos/logo.svg";
 
@@ -33,6 +34,43 @@ function useIsLoggedIn() {
     setLoggedIn(document.cookie.includes("__session_flag=1"));
   }, []);
   return loggedIn;
+}
+
+function useDeviceInfo() {
+  const [device, setDevice] = useState<{
+    type: "cpu" | "cuda" | string;
+    name?: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    pixelApi
+      .getSystemDeps()
+      .then((deps) => setDevice({ type: deps.gpu.device, name: deps.gpu.name }))
+      .catch(() => {});
+  }, []);
+
+  return device;
+}
+
+function DeviceBadge() {
+  const device = useDeviceInfo();
+  if (!device) return null;
+
+  const isCuda = device.type === "cuda";
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium leading-none select-none",
+        isCuda
+          ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-500"
+          : "border-muted-foreground/20 bg-muted/40 text-muted-foreground",
+      )}
+      title={device.name ?? (isCuda ? "CUDA GPU" : "CPU inference")}
+    >
+      {isCuda ? <Zap className="size-3" /> : <Cpu className="size-3" />}
+      {isCuda ? "GPU" : "CPU"}
+    </div>
+  );
 }
 
 export function Header() {
@@ -144,6 +182,7 @@ export function Header() {
             </Button>
           </div>
           <div className="hidden items-center gap-3 md:flex">
+            <DeviceBadge />
             <Link href={SOCIAL_LINKS.github}>
               <Button className="bg-background text-sm" variant="outline">
                 <HugeiconsIcon icon={GithubIcon} className="size-4" />
