@@ -1695,6 +1695,7 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
     generated_temp_files: list[str] = []
     saved_outputs: list[str] = []
     source_files_to_cleanup: list[str] = []
+    t0 = time.time()
 
     try:
         log(f"[mem] RSS at start: {_rss_mb()}")
@@ -1797,7 +1798,9 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
             progress(min(file_progress_start + file_progress_span, 100))
 
         progress(100)
-        log(f"\n🎉 Transcription complete: {len(saved_outputs)} file(s) generated")
+        elapsed = time.time() - t0
+        minutes, seconds = divmod(int(elapsed), 60)
+        log(f"\n🎉 Transcription complete: {len(saved_outputs)} file(s) generated in {minutes}m{seconds:02d}s")
         log(f"[mem] RSS at end: {_rss_mb()}")
 
         result_data = {
@@ -1843,6 +1846,7 @@ def _run_transcribe_url(job_id: str, req: TranscribeUrlRequest, loop: asyncio.Ab
 
     history_ids: list[str] = []
     temp_files: list[str] = []
+    t0 = time.time()
 
     try:
         # Download
@@ -1976,7 +1980,9 @@ def _run_transcribe_url(job_id: str, req: TranscribeUrlRequest, loop: asyncio.Ab
             saved.append(out)
 
         progress(100)
-        log(f"\n🎉 Transcription complete: {len(saved)} file(s) generated")
+        elapsed = time.time() - t0
+        minutes, seconds = divmod(int(elapsed), 60)
+        log(f"\n🎉 Transcription complete: {len(saved)} file(s) generated in {minutes}m{seconds:02d}s")
         log(f"[mem] RSS at end: {_rss_mb()}")
 
         result_data = {
@@ -3177,6 +3183,7 @@ def _run_project_process(
         _jobs[job_id]["progress"] = pct
         _job_send(job_id, loop, {"type": "progress", "value": pct})
 
+    t0 = time.time()
     try:
         videos = proj_module.list_project_videos(project_id)
         if not videos:
@@ -3350,7 +3357,9 @@ def _run_project_process(
             proj_module.update_project(project_id, status="error")
 
         progress(100)
-        log("\nProcessamento concluido!")
+        elapsed = time.time() - t0
+        minutes, seconds = divmod(int(elapsed), 60)
+        log(f"\nProcessamento concluido em {minutes}m{seconds:02d}s")
         _job_finish(job_id, status="done")
         _job_send(job_id, loop, {"type": "done"})
 
