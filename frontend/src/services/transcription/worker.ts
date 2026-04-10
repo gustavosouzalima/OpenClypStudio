@@ -44,6 +44,30 @@ let transcriber: AutomaticSpeechRecognitionPipeline | null = null;
 let cancelled: boolean = false;
 let lastReportedProgress = -1;
 const fileBytes = new Map<string, { loaded: number; total: number }>();
+const EMPTY_TOKEN_IDS_ERROR = "token_ids must be a non-empty array of integers";
+const SILENCE_RMS_THRESHOLD = 0.0025;
+const MAX_RMS_SAMPLES = 16000;
+
+function isEmptyTokenIdsError(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		typeof error.message === "string" &&
+		error.message.includes(EMPTY_TOKEN_IDS_ERROR)
+	);
+}
+
+function estimateRms(audio: Float32Array): number {
+	if (!audio.length) return 0;
+	const step = Math.max(1, Math.floor(audio.length / MAX_RMS_SAMPLES));
+	let sumSquares = 0;
+	let count = 0;
+	for (let i = 0; i < audio.length; i += step) {
+		const sample = audio[i] ?? 0;
+		sumSquares += sample * sample;
+		count += 1;
+	}
+	return count > 0 ? Math.sqrt(sumSquares / count) : 0;
+}
 
 self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
 	const message = event.data;
@@ -203,6 +227,25 @@ async function handleTranscribe({
 	try {
 		const effectiveSampleRate = sampleRate && sampleRate > 0 ? sampleRate : 44100;
 		const durationSeconds = audio.length / effectiveSampleRate;
+		const chunkRms = estimateRms(audio);
+		if (chunkRms < SILENCE_RMS_THRESHOLD) {
+			self.postMessage({
+				type: "log",
+				message: `worker:silence-skip rms=${chunkRms.toFixed(6)} duration=${durationSeconds.toFixed(1)}s`,
+			} satisfies WorkerResponse);
+			self.postMessage({
+				type: "transcribe-progress",
+				progress: 100,
+			} satisfies WorkerResponse);
+			self.postMessage({
+				type: "transcribe-complete",
+				text: "",
+				segments: [],
+				language: null,
+			} satisfies WorkerResponse);
+			return;
+		}
+
 		let syntheticProgress = 0;
 		const estimatedMs = Math.max(15000, durationSeconds * 900);
 		const startedAt = Date.now();
@@ -251,11 +294,58 @@ async function handleTranscribe({
 
 		if (language && language !== "auto") {
 			pipelineOpts.language = language;
-		} else {
-			pipelineOpts.task = "transcribe";
 		}
+		pipelineOpts.task = "transcribe";
 
-		const rawResult = await transcriber(audio, pipelineOpts);
+		let rawResult: AutomaticSpeechRecognitionOutput | AutomaticSpeechRecognitionOutput[];
+		try {
+			rawResult = await transcriber(audio, pipelineOpts);
+		} catch (firstError) {
+			if (!isEmptyTokenIdsError(firstError)) {
+				throw firstError;
+			}
+
+			self.postMessage({
+				type: "log",
+				message: "worker:empty-token-ids retry-without-timestamps",
+			} satisfies WorkerResponse);
+
+			// Some WebGPU runs fail on timestamp decoding for near-silent chunks.
+			// Retry without timestamps to salvage plain text when possible.
+			try {
+				rawResult = await transcriber(audio, {
+					...pipelineOpts,
+					return_timestamps: false,
+					chunk_length_s: Math.max(inferenceChunkLength, 60),
+					stride_length_s: Math.min(inferenceStride, 2),
+				});
+			} catch (retryError) {
+				if (!isEmptyTokenIdsError(retryError)) {
+					throw retryError;
+				}
+
+				if (timer) {
+					self.clearInterval(timer);
+					timer = null;
+				}
+
+				self.postMessage({
+					type: "log",
+					message: "worker:empty-token-ids fallback-empty-chunk",
+				} satisfies WorkerResponse);
+				self.postMessage({
+					type: "transcribe-progress",
+					progress: 100,
+				} satisfies WorkerResponse);
+				self.postMessage({
+					type: "transcribe-complete",
+					text: "",
+					segments: [],
+					language: null,
+				} satisfies WorkerResponse);
+				return;
+			}
+		}
 		if (timer) {
 			self.clearInterval(timer);
 			timer = null;
