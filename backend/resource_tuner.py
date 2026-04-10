@@ -95,10 +95,14 @@ class ResourceSnapshot:
 
 # With cpu_threads=1 per worker, each worker uses ~150-250 MB for audio
 # buffers, VAD model instance, and CTranslate2 working memory.
-_RAM_PER_WORKER_MB = int(os.getenv("PIXEL_RAM_PER_WORKER_MB", "250"))
+_RAM_PER_WORKER_MB = int(os.getenv("PIXEL_RAM_PER_WORKER_MB", "220"))
 
 # Minimum free RAM to keep available (MB) so the system stays healthy.
-_RAM_HEADROOM_MB = int(os.getenv("PIXEL_RAM_HEADROOM_MB", "1500"))
+_RAM_HEADROOM_MB = int(os.getenv("PIXEL_RAM_HEADROOM_MB", "1024"))
+
+# Safety ceiling for chunk-level parallelism.
+# 0 disables this ceiling (parallelism then limited by CPU/RAM/env cap only).
+_HARD_MAX_PARALLEL_CHUNKS = int(os.getenv("PIXEL_HARD_MAX_PARALLEL_CHUNKS", "16"))
 
 
 def compute_parallel_chunks() -> int:
@@ -128,12 +132,17 @@ def compute_parallel_chunks() -> int:
     if env_max > 0:
         result = min(result, env_max)
 
-    # Sanity: never more than 8 (diminishing returns + I/O contention)
-    result = min(result, 8)
+    if _HARD_MAX_PARALLEL_CHUNKS > 0:
+        result = min(result, _HARD_MAX_PARALLEL_CHUNKS)
 
     logger.info(
-        "resource_tuner: parallel_chunks=%d (cpu_limit=%d, ram_limit=%d, avail=%dMB)",
-        result, cpu_limit, ram_limit, snap.available_ram_mb,
+        "resource_tuner: parallel_chunks=%d (cpu_limit=%d, ram_limit=%d, avail=%dMB, env_cap=%d, hard_cap=%d)",
+        result,
+        cpu_limit,
+        ram_limit,
+        snap.available_ram_mb,
+        env_max,
+        _HARD_MAX_PARALLEL_CHUNKS,
     )
     return result
 

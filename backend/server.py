@@ -210,8 +210,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 DEFAULT_TRANSCRIBE_MODEL = os.getenv("PIXEL_DEFAULT_WHISPER_MODEL", "small").strip() or "small"
-DEFAULT_TRANSCRIBE_BATCH_SIZE = _env_int("PIXEL_DEFAULT_BATCH_SIZE", 8, min_value=1)
-TRANSCRIBE_MAX_BATCH_SIZE_CPU = _env_int("PIXEL_MAX_BATCH_SIZE_CPU", 8, min_value=1)
+DEFAULT_TRANSCRIBE_BATCH_SIZE = _env_int("PIXEL_DEFAULT_BATCH_SIZE", 16, min_value=1)
+TRANSCRIBE_MAX_BATCH_SIZE_CPU = _env_int("PIXEL_MAX_BATCH_SIZE_CPU", 16, min_value=1)
 TRANSCRIBE_MAX_BATCH_SIZE_GPU = _env_int("PIXEL_MAX_BATCH_SIZE_GPU", 32, min_value=1)
 TRANSCRIBE_FORCE_CPU_SAFE_MODEL = _env_bool("PIXEL_FORCE_CPU_SAFE_MODEL", True)
 TRANSCRIBE_CPU_SAFE_MODEL = os.getenv("PIXEL_CPU_SAFE_MODEL", "medium").strip() or "medium"
@@ -342,6 +342,7 @@ def _build_wav_chunks(
 # ── Multiprocessing transcription (bypasses GIL on Linux) ────────────────────
 _mp_pool = None
 _mp_pool_model = None
+_mp_pool_workers = 0
 _mp_cancel_event: multiprocessing.Event | None = None
 
 _USE_MULTIPROCESSING = (
@@ -399,12 +400,17 @@ def _mp_transcribe_one(args: tuple) -> tuple:
 
 
 def _get_mp_pool(model_name: str, max_workers: int):
-    global _mp_pool, _mp_pool_model, _mp_cancel_event
-    if _mp_pool is not None and _mp_pool_model == model_name:
+    global _mp_pool, _mp_pool_model, _mp_pool_workers, _mp_cancel_event
+    if (
+        _mp_pool is not None
+        and _mp_pool_model == model_name
+        and _mp_pool_workers == max_workers
+    ):
         _mp_cancel_event.clear()
         return _mp_pool
     _shutdown_mp_pool()
     _mp_pool_model = model_name
+    _mp_pool_workers = max_workers
     _mp_cancel_event = _mp_ctx.Event()
     _mp_pool = _mp_ctx.Pool(
         processes=max_workers,
@@ -415,7 +421,7 @@ def _get_mp_pool(model_name: str, max_workers: int):
 
 
 def _shutdown_mp_pool():
-    global _mp_pool, _mp_pool_model
+    global _mp_pool, _mp_pool_model, _mp_pool_workers
     if _mp_pool is not None:
         try:
             _mp_pool.terminate()
@@ -424,6 +430,7 @@ def _shutdown_mp_pool():
             pass
         _mp_pool = None
         _mp_pool_model = None
+        _mp_pool_workers = 0
 
 
 def _transcribe_single_chunk(
@@ -1491,10 +1498,10 @@ async def transcribe_editor_audio(
 
     Request:
     - audio_file: WAV file (multipart/form-data)
-    - model: Whisper model size (default: PIXEL_DEFAULT_WHISPER_MODEL or "medium")
+    - model: Whisper model size (default: PIXEL_DEFAULT_WHISPER_MODEL or "small")
     - language: Language code or "auto" (default: auto)
-    - beam_size: Beam size for decoding (default: 5)
-    - batch_size: Batch size for batched inference (default: PIXEL_DEFAULT_BATCH_SIZE or 8)
+    - beam_size: Beam size for decoding (default: PIXEL_DEFAULT_BEAM_SIZE or 1)
+    - batch_size: Batch size for batched inference (default: PIXEL_DEFAULT_BATCH_SIZE or 16)
 
     Response:
     - text: Full transcription text

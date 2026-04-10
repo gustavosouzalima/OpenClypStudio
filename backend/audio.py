@@ -13,6 +13,7 @@ def convert_to_wav(input_file: str, log_fn=None) -> str | None:
         out = os.path.join(tempfile.gettempdir(), safe_name)
         cmd = [
             'ffmpeg', '-threads', '0', '-i', input_file,
+            '-vn', '-sn', '-dn',
             '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', '-y', out
         ]
         subprocess.run(cmd, check=True, capture_output=True, timeout=3600)

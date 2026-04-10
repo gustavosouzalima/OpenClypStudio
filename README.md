@@ -186,6 +186,11 @@ See `.env.openclyp.example` for all variables:
 | `PIXEL_DEFAULT_WHISPER_MODEL` | Default Whisper model for backend requests | Optional |
 | `PIXEL_DEFAULT_BATCH_SIZE` | Default batch size for backend transcription | Optional |
 | `PIXEL_MAX_BATCH_SIZE_CPU` | Maximum batch size when running on CPU | Optional |
+| `PIXEL_CPU_THREADS` | CTranslate2 CPU threads per worker (recommended: `1` for parallel chunking) | Optional |
+| `PIXEL_NUM_WORKERS` | CTranslate2 internal workers (`0` = auto tune) | Optional |
+| `PIXEL_MAX_PARALLEL_CHUNKS` | Hard cap for chunks processed in parallel (`0` = auto tune) | Optional |
+| `PIXEL_RAM_PER_WORKER_MB` | RAM budget per parallel chunk worker | Optional |
+| `PIXEL_RAM_HEADROOM_MB` | Minimum free RAM to preserve before adding workers | Optional |
 | `PIXEL_FORCE_CPU_SAFE_MODEL` | Auto-downgrade `large*` models on CPU (`true/false`) | Optional |
 | `PIXEL_CPU_SAFE_MODEL` | Safe model used when downgrade is enabled | Optional |
 | `PIXEL_TRANSCRIBE_CHUNK_SECONDS` | Chunk size for long audio transcription | Optional |

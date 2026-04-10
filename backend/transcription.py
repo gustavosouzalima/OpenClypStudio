@@ -16,6 +16,7 @@ internal pool can handle W concurrent requests.
 """
 
 import os
+import sys
 import warnings
 import logging
 
@@ -53,8 +54,43 @@ _batched_cache: dict = {}
 
 # 1 thread per CTranslate2 call — parallelism comes from multiple workers.
 _CPU_THREADS = int(os.getenv("PIXEL_CPU_THREADS", "1"))
-# CTranslate2 internal worker pool size — must be >= parallel chunk workers.
-_NUM_WORKERS = int(os.getenv("PIXEL_NUM_WORKERS", "0")) or 1
+
+
+def _resolve_num_workers() -> int:
+    """Resolve CTranslate2 worker pool size with safe auto-tuning."""
+    raw_env = os.getenv("PIXEL_NUM_WORKERS", "").strip()
+    if raw_env:
+        try:
+            return max(1, int(raw_env))
+        except ValueError:
+            pass
+
+    # On non-Windows with multiprocessing enabled, each process handles one
+    # chunk at a time. Keep 1 internal worker per process to avoid contention.
+    mp_disabled = os.getenv("PIXEL_NO_MULTIPROCESSING", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if sys.platform != "win32" and not mp_disabled:
+        return 1
+
+    # Keep model-side worker pool aligned with current runtime concurrency.
+    # This avoids an internal bottleneck when chunk-level parallelism > 1.
+    try:
+        import resource_tuner
+
+        auto_workers = int(resource_tuner.compute_parallel_chunks())
+        return max(1, auto_workers)
+    except Exception:
+        pass
+
+    return max(1, os.cpu_count() or 1)
+
+
+# CTranslate2 internal worker pool size — should be >= chunk parallel workers.
+_NUM_WORKERS = _resolve_num_workers()
 
 
 def get_whisper_model(model_size: str, log_fn=None):
