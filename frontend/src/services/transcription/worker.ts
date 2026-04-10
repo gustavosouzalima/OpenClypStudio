@@ -59,9 +59,15 @@ async function handleInit({ modelId }: { modelId: string }) {
 	fileBytes.clear();
 
 	try {
-		const model = TRANSCRIPTION_MODELS.find((m) => m.id === modelId);
+		// Accept both internal ids (e.g. "whisper-small") and huggingFace ids
+		// (e.g. "onnx-community/whisper-small") for compatibility with callers.
+		const model =
+			TRANSCRIPTION_MODELS.find((m) => m.id === modelId) ??
+			TRANSCRIPTION_MODELS.find((m) => m.huggingFaceId === modelId);
 		if (!model) {
-			throw new Error(`Unknown model: ${modelId} - available models: ${TRANSCRIPTION_MODELS.map((m) => m.id).join(", ")}`);
+			throw new Error(
+				`Unknown model: ${modelId} - available models: ${TRANSCRIPTION_MODELS.map((m) => `${m.id} (${m.huggingFaceId})`).join(", ")}`,
+			);
 		}
 
 		console.log("[worker] Loading model:", {
@@ -70,7 +76,7 @@ async function handleInit({ modelId }: { modelId: string }) {
 			huggingFaceId: model.huggingFaceId,
 		});
 
-		transcriber = (await pipeline("automatic-speech-recognition", modelId, {
+		transcriber = (await pipeline("automatic-speech-recognition", model.huggingFaceId, {
 			dtype: "q4",
 			device: "auto",
 			progress_callback: (progressInfo: {

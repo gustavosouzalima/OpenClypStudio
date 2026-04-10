@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
@@ -28,6 +28,16 @@ import {
   CheckCircle,
   AlertCircle,
 } from "lucide-react";
+import { transcriptionService } from "@/services/transcription/service";
+import type { TranscriptionLanguage } from "@/types/transcription";
+import {
+  detectBrowserTranscriptionCapabilities,
+  mapServerModelToLocalModel,
+  resolveTranscriptionEngine,
+  type BrowserTranscriptionCapabilities,
+  type TranscriptionEnginePreference,
+} from "./transcription-engine";
+import { decodeAudioBlobToMonoFloat32 } from "./decode-audio";
 
 const MODELS = [
   { value: "tiny", label: "Tiny (fast, less accurate)" },
@@ -55,9 +65,40 @@ const BEAM_SIZES = [1, 2, 3, 5, 8, 10];
 
 type Tab = "upload" | "url";
 
+const ENGINE_STORAGE_KEY = "pixel.transcription.engine.preference";
+
+const ENGINE_OPTIONS: Array<{
+  value: TranscriptionEnginePreference;
+  label: string;
+  hint: string;
+}> = [
+  {
+    value: "auto",
+    label: "Auto (recommended)",
+    hint: "Chooses local GPU/CPU when suitable, backend for heavier jobs.",
+  },
+  {
+    value: "local-gpu",
+    label: "Local Browser (GPU)",
+    hint: "Fast on compatible WebGPU devices, keeps media local.",
+  },
+  {
+    value: "local-cpu",
+    label: "Local Browser (CPU)",
+    hint: "Uses browser CPU; better for shorter files.",
+  },
+  {
+    value: "server",
+    label: "Backend Server (Python)",
+    hint: "Most stable path for long files and URL sources.",
+  },
+];
+
 export function PixelTranscriptionsShell() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const localCancelledRef = useRef(false);
+  const transcriptionStartedAtRef = useRef<number | null>(null);
 
   // State
   const [activeTab, setActiveTab] = useState<Tab>("upload");
@@ -75,6 +116,13 @@ export function PixelTranscriptionsShell() {
     speaker_names: {},
     output_format: "txt",
   });
+  const [enginePreference, setEnginePreference] =
+    useState<TranscriptionEnginePreference>("auto");
+  const [capabilities, setCapabilities] = useState<BrowserTranscriptionCapabilities>({
+    hasWebGpu: false,
+    logicalCores: 4,
+    deviceMemoryGb: null,
+  });
 
   // Job state
   const [activeJob, setActiveJob] = useState<PixelJobStatus | null>(null);
@@ -84,13 +132,74 @@ export function PixelTranscriptionsShell() {
   // Results state
   const [historyIds, setHistoryIds] = useState<string[]>([]);
   const [resultFiles, setResultFiles] = useState<string[]>([]);
+  const [localTranscript, setLocalTranscript] = useState<{
+    filename: string;
+    content: string;
+  } | null>(null);
+  const [totalDurationMs, setTotalDurationMs] = useState<number | null>(null);
 
   // View transcript
   const [viewingTranscript, setViewingTranscript] = useState<PixelHistoryItem | null>(null);
 
+  useEffect(() => {
+    setCapabilities(detectBrowserTranscriptionCapabilities());
+    const stored = window.localStorage.getItem(ENGINE_STORAGE_KEY);
+    if (!stored) return;
+    if (ENGINE_OPTIONS.some((option) => option.value === stored)) {
+      setEnginePreference(stored as TranscriptionEnginePreference);
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(ENGINE_STORAGE_KEY, enginePreference);
+  }, [enginePreference]);
+
+  const resolvedEngine = useMemo(
+    () =>
+      resolveTranscriptionEngine({
+        preference: enginePreference,
+        activeTab,
+        totalFileSizeBytes: selectedFiles.reduce((sum, file) => sum + file.size, 0),
+        capabilities,
+      }),
+    [enginePreference, activeTab, selectedFiles, capabilities],
+  );
+
+  const markTranscriptionFinished = () => {
+    if (!transcriptionStartedAtRef.current) return;
+    const durationMs = Date.now() - transcriptionStartedAtRef.current;
+    setTotalDurationMs(durationMs);
+    setActiveJob((current) => {
+      if (!current) return current;
+      const totalLabel = `Total time: ${formatDuration(durationMs)}`;
+      if (current.logs.some((entry) => entry.startsWith("Total time:"))) {
+        return current;
+      }
+      return {
+        ...current,
+        logs: [...current.logs, totalLabel].slice(-80),
+      };
+    });
+    transcriptionStartedAtRef.current = null;
+  };
+
+  const formatDuration = (durationMs: number) => {
+    const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) {
+      return `${hours}h ${minutes.toString().padStart(2, "0")}m ${seconds
+        .toString()
+        .padStart(2, "0")}s`;
+    }
+    return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+  };
+
   // Poll job
   useEffect(() => {
     if (!activeJob) return;
+    if (activeJob.job_id.startsWith("local-")) return;
     if (
       activeJob.status === "done" ||
       activeJob.status === "error" ||
@@ -105,6 +214,7 @@ export function PixelTranscriptionsShell() {
         setHistoryIds(result.history_ids || []);
         setResultFiles(result.files || []);
       }
+      markTranscriptionFinished();
       return;
     }
 
@@ -125,6 +235,7 @@ export function PixelTranscriptionsShell() {
             setHistoryIds(result.history_ids || []);
             setResultFiles(result.files || []);
           }
+          markTranscriptionFinished();
         }
       } catch (err) {
         console.error("Failed to poll job:", err);
@@ -195,6 +306,124 @@ export function PixelTranscriptionsShell() {
     mergeFiles(files);
   };
 
+  const appendLocalLog = (message: string) => {
+    setActiveJob((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        logs: [...current.logs, message].slice(-80),
+      };
+    });
+  };
+
+  const updateLocalProgress = (value: number) => {
+    setActiveJob((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        progress: Math.max(0, Math.min(100, value)),
+      };
+    });
+  };
+
+  const startServerTranscription = async () => {
+    let jobId: string;
+
+    if (activeTab === "url") {
+      const response = await pixelApi.transcribeUrl(url.trim(), config);
+      jobId = response.job_id;
+    } else {
+      const uploadResponse = await pixelApi.uploadFile(selectedFiles);
+      const filePaths = uploadResponse.paths;
+      const transcribeResponse = await pixelApi.transcribeFiles(filePaths, config);
+      jobId = transcribeResponse.job_id;
+    }
+
+    const job = await pixelApi.getJob(jobId);
+    setActiveJob(job);
+    setIsTranscribing(false);
+  };
+
+  const startLocalTranscription = async (engineLabel: "local-gpu" | "local-cpu") => {
+    const localJobId = `local-${crypto.randomUUID()}`;
+    const modelId = mapServerModelToLocalModel({
+      serverModel: config.model,
+      engine: engineLabel,
+    });
+    const totalFiles = selectedFiles.length;
+    const outputParts: string[] = [];
+    localCancelledRef.current = false;
+
+    setActiveJob({
+      job_id: localJobId,
+      status: "running",
+      progress: 0,
+      logs: [
+        `Using local engine (${engineLabel === "local-gpu" ? "GPU" : "CPU"})`,
+        `Model: ${modelId}`,
+      ],
+    });
+
+    for (let index = 0; index < totalFiles; index += 1) {
+      if (localCancelledRef.current) {
+        setActiveJob((current) =>
+          current
+            ? {
+                ...current,
+                status: "cancelled",
+                cancelled: true,
+                progress: Math.max(current.progress, 1),
+              }
+            : current,
+        );
+        setIsTranscribing(false);
+        markTranscriptionFinished();
+        return;
+      }
+
+      const file = selectedFiles[index];
+      appendLocalLog(`Decoding ${file.name} (${index + 1}/${totalFiles})...`);
+      const decoded = await decodeAudioBlobToMonoFloat32(file);
+
+      appendLocalLog(`Transcribing ${file.name}...`);
+      const result = await transcriptionService.transcribe({
+        audioData: decoded.samples,
+        language: config.language as TranscriptionLanguage,
+        modelId,
+        onProgress: (progress) => {
+          const fileProgress = Math.max(0, Math.min(100, progress.progress || 0));
+          const progressBase = (index / totalFiles) * 100;
+          const progressSpan = 100 / totalFiles;
+          updateLocalProgress(Math.floor(progressBase + (fileProgress / 100) * progressSpan));
+        },
+      });
+
+      outputParts.push(`# ${file.name}\n\n${result.text.trim()}`);
+      updateLocalProgress(Math.floor(((index + 1) / totalFiles) * 100));
+      appendLocalLog(`Completed ${file.name} (${result.segments.length} segments)`);
+    }
+
+    const mergedContent = outputParts.join("\n\n---\n\n");
+    const filename =
+      selectedFiles.length === 1
+        ? `${selectedFiles[0].name}.txt`
+        : `local-transcription-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
+
+    setLocalTranscript({ filename, content: mergedContent });
+    setActiveJob((current) =>
+      current
+        ? {
+            ...current,
+            status: "done",
+            progress: 100,
+            result: { history_ids: [], files: [] },
+          }
+        : current,
+    );
+    setIsTranscribing(false);
+    markTranscriptionFinished();
+  };
+
   const handleStartTranscription = async () => {
     if (activeTab === "url" && !url.trim()) {
       setJobError("Please enter a URL");
@@ -210,25 +439,26 @@ export function PixelTranscriptionsShell() {
     setActiveJob(null);
     setHistoryIds([]);
     setResultFiles([]);
+    setLocalTranscript(null);
+    setTotalDurationMs(null);
+    transcriptionStartedAtRef.current = Date.now();
 
     try {
-      let jobId: string;
-
-      if (activeTab === "url") {
-        const response = await pixelApi.transcribeUrl(url.trim(), config);
-        jobId = response.job_id;
-      } else {
-        // Upload file first
-        const uploadResponse = await pixelApi.uploadFile(selectedFiles);
-        const filePaths = uploadResponse.paths;
-        
-        // Then transcribe
-        const transcribeResponse = await pixelApi.transcribeFiles(filePaths, config);
-        jobId = transcribeResponse.job_id;
+      if (resolvedEngine.engine === "server") {
+        await startServerTranscription();
+        return;
       }
 
-      const job = await pixelApi.getJob(jobId);
-      setActiveJob(job);
+      try {
+        await startLocalTranscription(resolvedEngine.engine);
+      } catch (localError) {
+        console.error("Local transcription failed:", localError);
+        if (enginePreference === "auto") {
+          await startServerTranscription();
+          return;
+        }
+        throw localError;
+      }
     } catch (err) {
       console.error("Failed to start transcription:", err);
       let errorMsg = "Failed to start transcription";
@@ -245,11 +475,28 @@ export function PixelTranscriptionsShell() {
       }
       setJobError(errorMsg);
       setIsTranscribing(false);
+      markTranscriptionFinished();
     }
   };
 
   const handleCancelJob = async () => {
     if (!activeJob) return;
+    if (activeJob.job_id.startsWith("local-")) {
+      localCancelledRef.current = true;
+      transcriptionService.cancel();
+      setActiveJob((current) =>
+        current
+          ? {
+              ...current,
+              status: "cancelled",
+              cancelled: true,
+            }
+          : current,
+      );
+      setIsTranscribing(false);
+      markTranscriptionFinished();
+      return;
+    }
     try {
       await pixelApi.cancelJob(activeJob.job_id);
     } catch (err) {
@@ -284,6 +531,17 @@ export function PixelTranscriptionsShell() {
     a.href = `file://${filePath}`;
     a.download = filePath.split(/[/\\]/).pop() || "transcript.txt";
     a.click();
+  };
+
+  const handleExportLocalTranscript = () => {
+    if (!localTranscript) return;
+    const blob = new Blob([localTranscript.content], { type: "text/plain;charset=utf-8" });
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = localTranscript.filename;
+    a.click();
+    URL.revokeObjectURL(objectUrl);
   };
 
   const isJobActive = activeJob !== null &&
@@ -500,6 +758,41 @@ export function PixelTranscriptionsShell() {
               <CardTitle>Configuration</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label>Transcription Engine</Label>
+                <select
+                  value={enginePreference}
+                  onChange={(e) =>
+                    setEnginePreference(e.target.value as TranscriptionEnginePreference)
+                  }
+                  disabled={isJobActive}
+                  className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                >
+                  {ENGINE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-muted-foreground">
+                  {ENGINE_OPTIONS.find((option) => option.value === enginePreference)?.hint}
+                </p>
+                <div className="rounded-md border border-border/60 bg-muted/10 px-3 py-2 text-xs text-muted-foreground">
+                  <div>
+                    Runtime detection: WebGPU {capabilities.hasWebGpu ? "available" : "not available"} |
+                    CPU cores {capabilities.logicalCores}
+                    {capabilities.deviceMemoryGb !== null ? ` | Device memory ${capabilities.deviceMemoryGb}GB` : ""}
+                  </div>
+                  <div className="mt-1">
+                    Effective engine:{" "}
+                    <span className="font-medium text-foreground">
+                      {resolvedEngine.engine}
+                    </span>{" "}
+                    - {resolvedEngine.reason}
+                  </div>
+                </div>
+              </div>
+
               <div className="space-y-2">
                 <Label>Model</Label>
                 <select
@@ -764,6 +1057,44 @@ export function PixelTranscriptionsShell() {
                 <div className="text-sm text-muted-foreground">
                   Transcription Completed. Your files are ready.
                 </div>
+                {totalDurationMs !== null && (
+                  <div className="rounded-md border border-border/70 bg-muted/10 px-3 py-2 text-sm">
+                    Total time: <span className="font-semibold">{formatDuration(totalDurationMs)}</span>
+                  </div>
+                )}
+
+                {localTranscript && (
+                  <div className="space-y-2">
+                    <div className="text-sm font-medium">Local Transcript</div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        setViewingTranscript({
+                          id: "local",
+                          filename: localTranscript.filename,
+                          filepath: "",
+                          created_at: "",
+                          size_bytes: localTranscript.content.length,
+                          content: localTranscript.content,
+                        })
+                      }
+                      className="w-full"
+                    >
+                      <FileText className="size-4 mr-2" />
+                      View Local Transcript
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleExportLocalTranscript}
+                      className="w-full"
+                    >
+                      <Download className="size-4 mr-2" />
+                      Download TXT
+                    </Button>
+                  </div>
+                )}
 
                 {/* Saved to history */}
                 {historyIds.length > 0 && (
@@ -783,17 +1114,35 @@ export function PixelTranscriptionsShell() {
                     ))}
                   </div>
                 )}
+                {resultFiles.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="text-sm font-medium">Generated Files</div>
+                    {resultFiles.map((filePath) => (
+                      <Button
+                        key={filePath}
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleExportResult(filePath)}
+                        className="w-full"
+                      >
+                        <Download className="size-4 mr-2" />
+                        Download {filePath.split(/[/\\]/).pop()}
+                      </Button>
+                    ))}
+                  </div>
+                )}
 
                 {/* Actions */}
                 <div className="space-y-2">
                   <div className="text-sm font-medium">Actions</div>
-                  <Button onClick={handleCreateProject} className="w-full">
+                  <Button onClick={handleCreateProject} className="w-full" disabled={!historyIds.length}>
                     Create Project From Transcript
                   </Button>
                   <Button
                     variant="outline"
                     onClick={handleUseInDocuments}
                     className="w-full"
+                    disabled={!historyIds.length}
                   >
                     Use In AI Documents
                   </Button>
@@ -807,6 +1156,11 @@ export function PixelTranscriptionsShell() {
                       New Project
                     </Button>
                   </Link>
+                  {!historyIds.length && (
+                    <p className="text-xs text-muted-foreground">
+                      Local transcription does not create backend history entries. Use backend engine if you need project/document integration.
+                    </p>
+                  )}
                 </div>
 
                 {/* Reset */}
@@ -818,6 +1172,8 @@ export function PixelTranscriptionsShell() {
                     setResultFiles([]);
                     setJobError(null);
                     setIsTranscribing(false);
+                    setLocalTranscript(null);
+                    setTotalDurationMs(null);
                   }}
                   className="w-full"
                 >
