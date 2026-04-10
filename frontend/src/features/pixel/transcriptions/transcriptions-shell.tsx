@@ -120,7 +120,7 @@ export function PixelTranscriptionsShell() {
   const [config, setConfig] = useState<PixelTranscriptionRequest>({
     model: "large-v3-turbo",
     language: "auto",
-    beam_size: 5,
+    beam_size: 1,
     batch_size: 32,
     diarize: false,
     num_speakers: 2,

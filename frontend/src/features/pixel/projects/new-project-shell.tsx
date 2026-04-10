@@ -186,7 +186,7 @@ export function NewProjectShell() {
 	// Step 3 (AI only): Transcription config
 	const [model, setModel] = useState("large-v3-turbo");
 	const [language, setLanguage] = useState("auto");
-	const [beamSize, setBeamSize] = useState(5);
+	const [beamSize, setBeamSize] = useState(1);
 
 	// Step processing
 	const [createdProjectId, setCreatedProjectId] = useState<string | null>(null);

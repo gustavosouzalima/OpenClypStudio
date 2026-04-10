@@ -303,7 +303,7 @@ export function Captions() {
 			const result = await pixelApi.transcribeEditorAudio(audioBlob, {
 				model: "large-v3-turbo",
 				language: selectedLanguage === "auto" ? "auto" : selectedLanguage,
-				beam_size: 5,
+				beam_size: 1,
 				batch_size: 32,
 			});
 
