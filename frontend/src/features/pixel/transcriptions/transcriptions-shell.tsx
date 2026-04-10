@@ -410,6 +410,7 @@ export function PixelTranscriptionsShell() {
     modelId,
     language,
     engineLabel,
+    forceWorkerCount,
     onProgress,
   }: {
     fileName: string;
@@ -418,6 +419,7 @@ export function PixelTranscriptionsShell() {
     modelId: TranscriptionModelId;
     language: TranscriptionLanguage;
     engineLabel: "local-gpu" | "local-cpu";
+    forceWorkerCount?: number;
     onProgress: (progress: number) => void;
   }): Promise<{ text: string; segments: number }> => {
     const chunks: LocalChunkTask[] =
@@ -435,7 +437,8 @@ export function PixelTranscriptionsShell() {
             totalSamples: samples.length,
             sampleRate,
           });
-    const workerCount = Math.min(resolveLocalWorkerCount(engineLabel), chunks.length);
+    const resolvedWorkerCount = forceWorkerCount ?? resolveLocalWorkerCount(engineLabel);
+    const workerCount = Math.min(Math.max(1, resolvedWorkerCount), chunks.length);
     const services = Array.from({ length: Math.max(1, workerCount) }, () => new TranscriptionService());
     localServicesRef.current = services;
 
@@ -489,18 +492,23 @@ export function PixelTranscriptionsShell() {
             devicePreference: engineLabel === "local-gpu" ? "webgpu" : "wasm",
             onProgress: (progress) => {
               const raw = Math.max(0, Math.min(100, progress.progress || 0));
-              const normalized =
-                progress.status === "loading-model"
-                  ? Math.floor(raw * 0.15)
-                  : 15 + Math.floor(raw * 0.85);
-              const current = chunkProgress.get(chunk.index) ?? 0;
-              chunkProgress.set(chunk.index, Math.max(current, normalized));
-              updateOverallProgress();
-            },
-            onLog: (message) => {
+            const current = chunkProgress.get(chunk.index) ?? 0;
+            chunkProgress.set(chunk.index, Math.max(current, raw));
+            updateOverallProgress();
+          },
+          onLog: (message) => {
+            if (
+              message.startsWith("worker:init-start") ||
+              message.startsWith("worker:init-complete") ||
+              message.startsWith("worker:transcribe-start") ||
+              message.startsWith("worker:transcribe-running") ||
+              message.startsWith("worker:transcribe-complete") ||
+              message.startsWith("transcribe:error")
+            ) {
               appendLocalLog(`[${fileName}] worker-${workerIndex + 1} ${message}`);
-            },
-          });
+            }
+          },
+        });
         } catch (error) {
           const isEmptyTokenIdsError =
             error instanceof Error &&
@@ -868,6 +876,7 @@ export function PixelTranscriptionsShell() {
               modelId: cpuFallbackModelId,
               language: config.language as TranscriptionLanguage,
               engineLabel: "local-cpu",
+              forceWorkerCount: 1,
               onProgress: (fileProgress) => {
                 const bounded = Math.max(0, Math.min(100, fileProgress));
                 const progressBase = (index / totalFiles) * 100;

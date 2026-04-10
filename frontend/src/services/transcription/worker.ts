@@ -69,6 +69,20 @@ function estimateRms(audio: Float32Array): number {
 	return count > 0 ? Math.sqrt(sumSquares / count) : 0;
 }
 
+function collectChunkText(result: AutomaticSpeechRecognitionOutput): string {
+	if (!Array.isArray(result.chunks) || result.chunks.length === 0) return "";
+	return result.chunks
+		.map((chunk) => (typeof chunk.text === "string" ? chunk.text.trim() : ""))
+		.filter(Boolean)
+		.join(" ");
+}
+
+function collectResultText(result: AutomaticSpeechRecognitionOutput): string {
+	const directText = typeof result.text === "string" ? result.text.trim() : "";
+	if (directText.length > 0) return directText;
+	return collectChunkText(result);
+}
+
 self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
 	const message = event.data;
 
@@ -294,8 +308,9 @@ async function handleTranscribe({
 
 		if (language && language !== "auto") {
 			pipelineOpts.language = language;
+		} else {
+			pipelineOpts.task = "transcribe";
 		}
-		pipelineOpts.task = "transcribe";
 
 		let rawResult: AutomaticSpeechRecognitionOutput | AutomaticSpeechRecognitionOutput[];
 		try {
@@ -351,9 +366,45 @@ async function handleTranscribe({
 			timer = null;
 		}
 
-		const result: AutomaticSpeechRecognitionOutput = Array.isArray(rawResult)
+		let result: AutomaticSpeechRecognitionOutput = Array.isArray(rawResult)
 			? rawResult[0]
 			: rawResult;
+
+		if (returnTimestamps && collectResultText(result).length === 0) {
+			self.postMessage({
+				type: "log",
+				message: "worker:empty-text retry-without-timestamps",
+			} satisfies WorkerResponse);
+			try {
+				const retryRaw = await transcriber(audio, {
+					...pipelineOpts,
+					return_timestamps: false,
+					chunk_length_s: Math.max(inferenceChunkLength, 60),
+					stride_length_s: Math.min(inferenceStride, 2),
+				});
+				const retryResult: AutomaticSpeechRecognitionOutput = Array.isArray(retryRaw)
+					? retryRaw[0]
+					: retryRaw;
+				if (collectResultText(retryResult).length > 0) {
+					rawResult = retryRaw;
+					result = retryResult;
+					self.postMessage({
+						type: "log",
+						message: "worker:empty-text retry-succeeded",
+					} satisfies WorkerResponse);
+				} else {
+					self.postMessage({
+						type: "log",
+						message: "worker:empty-text retry-still-empty",
+					} satisfies WorkerResponse);
+				}
+			} catch (retryError) {
+				self.postMessage({
+					type: "log",
+					message: `worker:empty-text retry-failed ${retryError instanceof Error ? retryError.message : "unknown error"}`,
+				} satisfies WorkerResponse);
+			}
+		}
 
 		console.log("[worker] Transcription raw result:", {
 			type: typeof rawResult,
@@ -399,9 +450,11 @@ async function handleTranscribe({
 		segments,
 		});
 
-		if (segments.length === 0) {
+		const finalText = collectResultText(result);
+
+		if (segments.length === 0 && finalText.length > 0) {
 			segments.push({
-				text: result.text,
+				text: finalText,
 				start: 0,
 				end: durationSeconds,
 			});
@@ -417,7 +470,7 @@ async function handleTranscribe({
 
 		self.postMessage({
 			type: "transcribe-complete",
-			text: result.text,
+			text: finalText,
 			segments,
 			language: typeof (rawResult as Record<string, unknown>)?.language === "string"
 				? (rawResult as Record<string, unknown>).language as string
