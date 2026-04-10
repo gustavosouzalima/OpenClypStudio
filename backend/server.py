@@ -173,7 +173,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 COMPILADOS_DIR = DATA_DIR / "compilados"
 COMPILADOS_DIR.mkdir(parents=True, exist_ok=True)
 
-TRANSCRIBE_CHUNK_SECONDS = max(0, int(os.getenv("PIXEL_TRANSCRIBE_CHUNK_SECONDS", "120")))
+TRANSCRIBE_CHUNK_SECONDS = max(0, int(os.getenv("PIXEL_TRANSCRIBE_CHUNK_SECONDS", "60")))
 TRANSCRIBE_CHUNK_OVERLAP_SECONDS = max(0.0, float(os.getenv("PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS", "1.0")))
 
 logger.info(

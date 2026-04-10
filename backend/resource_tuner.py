@@ -93,27 +93,26 @@ class ResourceSnapshot:
         )
 
 
-# Approximate RAM usage per concurrent transcription worker (MB).
-# Includes VAD model, audio buffer, and CTranslate2 working memory.
-_RAM_PER_WORKER_MB = 400
+# With cpu_threads=1 per worker, each worker uses ~150-250 MB for audio
+# buffers, VAD model instance, and CTranslate2 working memory.
+_RAM_PER_WORKER_MB = int(os.getenv("PIXEL_RAM_PER_WORKER_MB", "250"))
 
 # Minimum free RAM to keep available (MB) so the system stays healthy.
 _RAM_HEADROOM_MB = int(os.getenv("PIXEL_RAM_HEADROOM_MB", "1500"))
 
 
-def compute_parallel_chunks(model_rss_mb: int = 0) -> int:
+def compute_parallel_chunks() -> int:
     """Return how many chunks can be transcribed in parallel right now.
 
-    Takes into account:
-    - Available CPU cores
-    - Available RAM minus a safety headroom
-    - Estimated RAM cost per parallel worker
+    Strategy: 1 worker per CPU core (each with cpu_threads=1), capped by
+    available RAM.  This eliminates OpenMP thread contention and gives
+    near-linear CPU scaling.
     """
     snap = ResourceSnapshot()
     logger.info("resource_tuner: %s", snap)
 
-    # CPU-based limit: leave 1 core for the system / event-loop
-    cpu_limit = max(1, snap.cpu_count - 1)
+    # CPU-based limit: use ALL cores (workers have 1 thread each, no contention)
+    cpu_limit = max(1, snap.cpu_count)
 
     # RAM-based limit
     free_for_workers = snap.available_ram_mb - _RAM_HEADROOM_MB
