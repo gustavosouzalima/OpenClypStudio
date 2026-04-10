@@ -317,7 +317,19 @@ document.addEventListener('alpine:init', () => {
         const up = await fetch('/api/upload', { method: 'POST', headers: authHeaders(), body: formData });
         if (up.ok) { const { paths: p } = await up.json(); uploadedPaths = [...uploadedPaths, ...p]; }
       }
-      const res = await api.post('/api/transcribe', { files: uploadedPaths, ...this.config });
+      const res = await api.post('/api/transcribe', {
+        files: uploadedPaths,
+        model: this.config.model,
+        language: this.config.language,
+        beam_size: this.config.beam_size,
+        batch_size: this.config.batch_size,
+        diarize: this.config.diarize,
+        num_speakers: this.config.num_speakers,
+        auto_detect_speakers: this.config.auto_detect_speakers,
+        speaker_names: this.config.speaker_names,
+        output_format: this.config.output_format,
+        vad_filter: this.config.vadFilter !== false,
+      });
       if (!res.ok) { this.logs.push(`❌ ${(await res.json()).detail}`); this.running = false; return; }
       const { job_id } = await res.json();
       this.jobId = job_id;

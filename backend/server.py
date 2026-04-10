@@ -368,6 +368,47 @@ def _mp_init_worker(model_name: str):
 
 
 _mp_batched = None
+_NO_CLIP_TIMESTAMPS_ERR = "No clip timestamps found"
+
+
+def _call_batched_transcribe_with_vad_retry(
+    batched,
+    *,
+    chunk_path: str,
+    language: str | None,
+    beam_size: int,
+    batch_size: int,
+    vad_filter: bool,
+):
+    """Run batched.transcribe with one safe fallback for missing clip timestamps.
+
+    Some faster-whisper versions can raise:
+    "No clip timestamps found. Set 'vad_filter' to True or provide 'clip_timestamps'."
+    when VAD is disabled. In that case we retry once with VAD enabled.
+    """
+    kwargs = dict(
+        language=language,
+        beam_size=beam_size,
+        batch_size=batch_size,
+        condition_on_previous_text=False,
+    )
+
+    try:
+        return batched.transcribe(
+            chunk_path,
+            vad_filter=vad_filter,
+            vad_parameters=dict(min_silence_duration_ms=500) if vad_filter else None,
+            **kwargs,
+        )
+    except Exception as exc:
+        if vad_filter or _NO_CLIP_TIMESTAMPS_ERR not in str(exc):
+            raise
+        return batched.transcribe(
+            chunk_path,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+            **kwargs,
+        )
 
 
 def _mp_transcribe_one(args: tuple) -> tuple:
@@ -375,14 +416,13 @@ def _mp_transcribe_one(args: tuple) -> tuple:
     if _mp_cancel_event and _mp_cancel_event.is_set():
         return (chunk_index, [], None, None)
     try:
-        segments_gen, info = _mp_batched.transcribe(
-            chunk_path,
+        segments_gen, info = _call_batched_transcribe_with_vad_retry(
+            _mp_batched,
+            chunk_path=chunk_path,
             language=language,
             beam_size=beam_size,
             batch_size=batch_size,
             vad_filter=vad_filter,
-            vad_parameters=dict(min_silence_duration_ms=500) if vad_filter else None,
-            condition_on_previous_text=False,
         )
         detected = getattr(info, "language", None)
         segments = []
@@ -444,14 +484,13 @@ def _transcribe_single_chunk(
     vad_filter: bool = True,
 ) -> tuple[list, str | None]:
     """Transcribe one audio chunk. Safe to call from a ThreadPoolExecutor."""
-    segments_gen, info = batched.transcribe(
-        chunk_path,
+    segments_gen, info = _call_batched_transcribe_with_vad_retry(
+        batched,
+        chunk_path=chunk_path,
         language=language,
         beam_size=beam_size,
         batch_size=batch_size,
         vad_filter=vad_filter,
-        vad_parameters=dict(min_silence_duration_ms=500) if vad_filter else None,
-        condition_on_previous_text=False,
     )
     detected = getattr(info, "language", None)
     segments = []
@@ -1624,7 +1663,7 @@ class TranscribeUrlRequest(BaseModel):
     language: str = "pt"
     beam_size: int = DEFAULT_BEAM_SIZE
     batch_size: int = DEFAULT_TRANSCRIBE_BATCH_SIZE
-    vad_filter: bool = False
+    vad_filter: bool = True
     diarize: bool = False
     num_speakers: int = 2
     auto_detect_speakers: bool = False
@@ -1638,7 +1677,7 @@ class TranscribeRequest(BaseModel):
     language: str = "pt"
     beam_size: int = DEFAULT_BEAM_SIZE
     batch_size: int = DEFAULT_TRANSCRIBE_BATCH_SIZE
-    vad_filter: bool = False
+    vad_filter: bool = True
     diarize: bool = False
     num_speakers: int = 2
     auto_detect_speakers: bool = False
@@ -1663,7 +1702,7 @@ class ProcessProjectRequest(BaseModel):
     language: str = "auto"
     beam_size: int = DEFAULT_BEAM_SIZE
     batch_size: int = DEFAULT_TRANSCRIBE_BATCH_SIZE
-    vad_filter: bool = False
+    vad_filter: bool = True
     diarize: bool = False
 
 
