@@ -18,6 +18,7 @@ import time
 import uuid
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body, WebSocket, WebSocketDisconnect, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -155,6 +156,9 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 COMPILADOS_DIR = DATA_DIR / "compilados"
 COMPILADOS_DIR.mkdir(parents=True, exist_ok=True)
 
+TRANSCRIBE_CHUNK_SECONDS = max(0, int(os.getenv("PIXEL_TRANSCRIBE_CHUNK_SECONDS", "300")))
+TRANSCRIBE_CHUNK_OVERLAP_SECONDS = max(0.0, float(os.getenv("PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS", "1.0")))
+
 
 def _is_path_within_dir(path: Path, parent_dir: Path) -> bool:
     try:
@@ -162,6 +166,160 @@ def _is_path_within_dir(path: Path, parent_dir: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _build_wav_chunks(
+    audio_path: str,
+    duration: float,
+    chunk_seconds: int,
+    overlap_seconds: float,
+    log_fn=None,
+) -> tuple[list[tuple[str, float]], list[str]]:
+    chunk_dir = UPLOAD_DIR / "chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+
+    chunks: list[tuple[str, float]] = []
+    temp_files: list[str] = []
+    start = 0.0
+    index = 0
+
+    while start < duration:
+        chunk_duration = min(float(chunk_seconds) + overlap_seconds, duration - start)
+        chunk_path = chunk_dir / f"{Path(audio_path).stem}_chunk_{uuid.uuid4().hex}_{index:04d}.wav"
+        cmd = [
+            "ffmpeg",
+            "-threads",
+            "0",
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{chunk_duration:.3f}",
+            "-i",
+            audio_path,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            "-y",
+            str(chunk_path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=3600)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("FFmpeg timed out while splitting audio into chunks.") from exc
+        except FileNotFoundError as exc:
+            raise RuntimeError("FFmpeg not found while splitting audio into chunks.") from exc
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or b"").decode(errors="ignore")[:240]
+            raise RuntimeError(f"Failed to split audio chunk: {stderr}") from exc
+
+        chunks.append((str(chunk_path), start))
+        temp_files.append(str(chunk_path))
+        start += float(chunk_seconds)
+        index += 1
+
+    if log_fn and len(chunks) > 1:
+        log_fn(f"🔪 Chunking enabled: {len(chunks)} chunk(s) of ~{chunk_seconds}s")
+
+    return chunks, temp_files
+
+
+def _transcribe_with_optional_chunking(
+    *,
+    batched,
+    audio_path: str,
+    duration: float,
+    language: str | None,
+    beam_size: int,
+    batch_size: int,
+    is_cancelled,
+    progress_fn=None,
+    progress_start: int = 0,
+    progress_span: int = 100,
+    log_fn=None,
+) -> tuple[list, str | None, list[str]]:
+    if duration <= 0:
+        duration = 1.0
+
+    chunk_seconds = TRANSCRIBE_CHUNK_SECONDS
+    overlap_seconds = TRANSCRIBE_CHUNK_OVERLAP_SECONDS
+
+    temp_chunk_files: list[str] = []
+    if chunk_seconds > 0 and duration > float(chunk_seconds):
+        chunks, temp_chunk_files = _build_wav_chunks(
+            audio_path=audio_path,
+            duration=duration,
+            chunk_seconds=chunk_seconds,
+            overlap_seconds=overlap_seconds,
+            log_fn=log_fn,
+        )
+    else:
+        chunks = [(audio_path, 0.0)]
+
+    segments_list: list = []
+    detected_language: str | None = None
+    last_pct = progress_start
+    covered_until = 0.0
+
+    def emit_progress(absolute_end: float) -> None:
+        nonlocal last_pct
+        if not progress_fn:
+            return
+        frac = max(0.0, min(absolute_end / duration, 1.0))
+        pct = min(progress_start + int(frac * max(progress_span, 1)), progress_start + progress_span)
+        if pct > last_pct:
+            progress_fn(pct)
+            last_pct = pct
+
+    for chunk_index, (chunk_path, chunk_offset) in enumerate(chunks):
+        if is_cancelled():
+            break
+
+        if log_fn and len(chunks) > 1:
+            log_fn(f"   Chunk {chunk_index + 1}/{len(chunks)}")
+
+        segments_gen, info = batched.transcribe(
+            chunk_path,
+            language=language,
+            beam_size=beam_size,
+            batch_size=batch_size,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+            condition_on_previous_text=False,
+        )
+        if detected_language is None:
+            detected_language = getattr(info, "language", None)
+
+        for seg in segments_gen:
+            if is_cancelled():
+                break
+
+            abs_start = chunk_offset + float(seg.start)
+            abs_end = chunk_offset + float(seg.end)
+
+            # Avoid duplicated segments caused by overlap between adjacent chunks.
+            if chunk_index > 0 and abs_end <= covered_until + 0.01:
+                continue
+
+            segments_list.append(
+                SimpleNamespace(
+                    text=seg.text,
+                    start=abs_start,
+                    end=abs_end,
+                )
+            )
+            emit_progress(abs_end)
+
+        if len(chunks) > 1:
+            # Previous chunk effectively covers `chunk_seconds + overlap_seconds`
+            # from its own offset. Keep this absolute boundary so the next chunk
+            # does not duplicate tail segments.
+            nominal_chunk_end = min(duration, chunk_offset + float(chunk_seconds) + overlap_seconds)
+            covered_until = max(covered_until, nominal_chunk_end)
+
+    return segments_list, detected_language, temp_chunk_files
 
 # ── Job Manager ──────────────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}  # job_id → {status, progress, logs, result, error}
@@ -1034,22 +1192,27 @@ async def transcribe_editor_audio(
                 detail=f"Failed to load Whisper model: {model}"
             )
 
-        # Transcribe
-        segments_gen, info = batched.transcribe(
-            audio_path,
+        # Transcribe (with chunking for long media)
+        segments_list_raw, detected_language, temp_chunk_files = _transcribe_with_optional_chunking(
+            batched=batched,
+            audio_path=audio_path,
+            duration=duration,
             language=lang_param,
             beam_size=beam_size,
             batch_size=batch_size,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            condition_on_previous_text=False,
+            is_cancelled=lambda: False,
+            log_fn=None,
         )
+        for temp_chunk in temp_chunk_files:
+            try:
+                Path(temp_chunk).unlink(missing_ok=True)
+            except Exception:
+                pass
 
-        # Collect segments
-        segments_list = []
         full_text_parts = []
+        segments_list = []
 
-        for seg in segments_gen:
+        for seg in segments_list_raw:
             segment = EditorTranscriptionSegment(
                 text=seg.text.strip(),
                 start=float(seg.start),
@@ -1065,7 +1228,7 @@ async def transcribe_editor_audio(
             text=full_text,
             segments=segments_list,
             language=language,
-            detected_language=info.language if language == "auto" else None,
+            detected_language=detected_language if language == "auto" else None,
         )
 
         return result
@@ -1387,32 +1550,22 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
             file_progress_span = max(1, int(100 / total_files))
             progress(max(1, file_progress_start + 5))
 
-            segments_gen, info = batched.transcribe(
-                audio_path,
+            segments_list, detected_language, chunk_temp_files = _transcribe_with_optional_chunking(
+                batched=batched,
+                audio_path=audio_path,
+                duration=duration,
                 language=language,
                 beam_size=req.beam_size,
                 batch_size=req.batch_size,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
-                condition_on_previous_text=False,
+                is_cancelled=lambda: bool(_jobs[job_id].get("cancelled")),
+                progress_fn=progress,
+                progress_start=file_progress_start + 5,
+                progress_span=max(file_progress_span - 10, 1),
+                log_fn=log,
             )
+            generated_temp_files.extend(chunk_temp_files)
 
-            segments_list = []
-            last_pct = file_progress_start + 5
-            for seg in segments_gen:
-                if _jobs[job_id].get("cancelled"):
-                    break
-                segments_list.append(seg)
-                if duration > 0:
-                    seg_pct = int((seg.end / duration) * max(file_progress_span - 10, 1))
-                else:
-                    seg_pct = 0
-                pct = min(file_progress_start + 5 + seg_pct, file_progress_start + file_progress_span - 5)
-                if pct > last_pct:
-                    progress(pct)
-                    last_pct = pct
-
-            log(f"✅ {len(segments_list)} segments | detected language: {info.language}")
+            log(f"✅ {len(segments_list)} segments | detected language: {detected_language or 'unknown'}")
 
             speaker_map = None
             if req.diarize:
@@ -1569,27 +1722,22 @@ def _run_transcribe_url(job_id: str, req: TranscribeUrlRequest, loop: asyncio.Ab
         if not batched:
             raise RuntimeError("Failed to load Whisper model.")
 
-        segments_gen, info = batched.transcribe(
-            audio_path,
+        segments_list, detected_language, chunk_temp_files = _transcribe_with_optional_chunking(
+            batched=batched,
+            audio_path=audio_path,
+            duration=duration,
             language=language,
             beam_size=req.beam_size,
             batch_size=req.batch_size,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            condition_on_previous_text=False,
+            is_cancelled=lambda: bool(_jobs[job_id].get("cancelled")),
+            progress_fn=progress,
+            progress_start=30,
+            progress_span=65,
+            log_fn=log,
         )
+        temp_files.extend(chunk_temp_files)
 
-        segments_list, last_pct = [], 30
-        for seg in segments_gen:
-            if _jobs[job_id].get("cancelled"):
-                break
-            segments_list.append(seg)
-            pct = min(int((seg.end / duration) * 65) + 30, 95)
-            if pct > last_pct:
-                progress(pct)
-                last_pct = pct
-
-        log(f"✅ {len(segments_list)} segments | detected language: {info.language}")
+        log(f"✅ {len(segments_list)} segments | detected language: {detected_language or 'unknown'}")
         progress(95)
 
         # Diarization
@@ -2925,6 +3073,7 @@ def _run_project_process(
             proj_module.update_video(video_id, status="transcribing")
 
             temp_wav = None
+            chunk_temp_files: list[str] = []
             try:
                 if not local_path.lower().endswith(".wav"):
                     temp_wav = audio.convert_to_wav(local_path, log)
@@ -2939,21 +3088,16 @@ def _run_project_process(
                 duration_wav = audio.get_wav_duration(audio_path)
                 language = None if req.language == "auto" else req.language
 
-                segs_gen, info = batched.transcribe(
-                    audio_path,
+                segments_list, detected_language, chunk_temp_files = _transcribe_with_optional_chunking(
+                    batched=batched,
+                    audio_path=audio_path,
+                    duration=duration_wav,
                     language=language,
                     beam_size=req.beam_size,
-                    batch_size=32,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=500),
-                    condition_on_previous_text=False,
+                    batch_size=req.batch_size,
+                    is_cancelled=lambda: bool(_jobs[job_id].get("cancelled")),
+                    log_fn=log,
                 )
-
-                segments_list = []
-                for seg in segs_gen:
-                    if _jobs[job_id].get("cancelled"):
-                        break
-                    segments_list.append(seg)
 
                 # Optional diarization
                 speaker_map = None
@@ -2986,7 +3130,7 @@ def _run_project_process(
                     transcription=transcription,
                     duration=video_duration,
                 )
-                log(f"{len(transcription)} segmentos | idioma: {info.language}")
+                log(f"{len(transcription)} segmentos | idioma: {detected_language or 'unknown'}")
 
             except Exception as e:
                 log(f"Erro na transcricao: {e}")
@@ -2995,6 +3139,11 @@ def _run_project_process(
                 if temp_wav:
                     try:
                         os.remove(temp_wav)
+                    except OSError:
+                        pass
+                for temp_chunk in chunk_temp_files:
+                    try:
+                        os.remove(temp_chunk)
                     except OSError:
                         pass
 
