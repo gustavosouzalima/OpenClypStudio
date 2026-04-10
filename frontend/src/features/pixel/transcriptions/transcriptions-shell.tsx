@@ -651,6 +651,8 @@ export function PixelTranscriptionsShell() {
 
     const chunkProgress = new Map<number, number>();
     const chunkResults = new Map<number, { text: string; segments: Array<{ text: string; start: number; end: number }> }>();
+    let meaningfulChunkCount = 0;
+    let accumulatedTextChars = 0;
 
     const updateOverallProgress = () => {
       let sum = 0;
@@ -714,6 +716,10 @@ export function PixelTranscriptionsShell() {
       chunkResults.set(chunk.index, { text: result.text, segments: shiftedSegments });
       chunkProgress.set(chunk.index, 100);
       const chunkTextPreview = result.text.trim().slice(0, 80);
+      if (result.text.trim().length > 0) {
+        meaningfulChunkCount += 1;
+        accumulatedTextChars += result.text.trim().length;
+      }
       appendLocalLog(
         `[${fileName}] chunk ${chunk.index + 1}/${chunks.length} done (${shiftedSegments.length} segs${chunkTextPreview ? `, text="${chunkTextPreview}..."` : ", EMPTY"})`,
       );
@@ -737,6 +743,12 @@ export function PixelTranscriptionsShell() {
     }
 
     const text = mergedSegments.map((segment) => segment.text.trim()).filter(Boolean).join(" ");
+    const lowSignalGpuOutput =
+      chunks.length >= 4 &&
+      (meaningfulChunkCount <= Math.floor(chunks.length * 0.2) || accumulatedTextChars < 24);
+    if (lowSignalGpuOutput) {
+      throw new Error("GPU_LOW_SIGNAL_OUTPUT");
+    }
     if (!text.trim()) {
       appendLocalLog(`WARNING: GPU transcription produced empty text (${mergedSegments.length} segments). WebGPU may not be fully supported. Try CPU mode.`);
     }
@@ -767,6 +779,10 @@ export function PixelTranscriptionsShell() {
     const mappedModelId = mapServerModelToLocalModel({
       serverModel: config.model,
       engine: engineLabel,
+    });
+    const cpuFallbackModelId = mapServerModelToLocalModel({
+      serverModel: config.model,
+      engine: "local-cpu",
     });
     const modelId = mappedModelId;
     const totalFiles = selectedFiles.length;
@@ -819,36 +835,63 @@ export function PixelTranscriptionsShell() {
           `[${file.name}] decoded sampleRate=${decoded.sampleRate}Hz samples=${decoded.samples.length}`,
         );
 
-        const perFileResult =
-          engineLabel === "local-gpu"
-            ? await transcribeDecodedFileDirectGpu({
-                service: sharedGpuService as TranscriptionService,
-                fileName: file.name,
-                samples: decoded.samples,
-                sampleRate: decoded.sampleRate,
-                modelId,
-                language: config.language as TranscriptionLanguage,
-                onProgress: (fileProgress) => {
-                  const bounded = Math.max(0, Math.min(100, fileProgress));
-                  const progressBase = (index / totalFiles) * 100;
-                  const progressSpan = 100 / totalFiles;
-                  updateLocalProgress(Math.floor(progressBase + (bounded / 100) * progressSpan));
-                },
-              })
-            : await transcribeDecodedFileWithLocalWorkers({
-                fileName: file.name,
-                samples: decoded.samples,
-                sampleRate: decoded.sampleRate,
-                modelId,
-                language: config.language as TranscriptionLanguage,
-                engineLabel,
-                onProgress: (fileProgress) => {
-                  const bounded = Math.max(0, Math.min(100, fileProgress));
-                  const progressBase = (index / totalFiles) * 100;
-                  const progressSpan = 100 / totalFiles;
-                  updateLocalProgress(Math.floor(progressBase + (bounded / 100) * progressSpan));
-                },
-              });
+        let perFileResult;
+        if (engineLabel === "local-gpu") {
+          try {
+            perFileResult = await transcribeDecodedFileDirectGpu({
+              service: sharedGpuService as TranscriptionService,
+              fileName: file.name,
+              samples: decoded.samples,
+              sampleRate: decoded.sampleRate,
+              modelId,
+              language: config.language as TranscriptionLanguage,
+              onProgress: (fileProgress) => {
+                const bounded = Math.max(0, Math.min(100, fileProgress));
+                const progressBase = (index / totalFiles) * 100;
+                const progressSpan = 100 / totalFiles;
+                updateLocalProgress(Math.floor(progressBase + (bounded / 100) * progressSpan));
+              },
+            });
+          } catch (gpuError) {
+            const gpuMessage =
+              gpuError instanceof Error ? gpuError.message : String(gpuError);
+            if (gpuMessage !== "GPU_LOW_SIGNAL_OUTPUT") {
+              throw gpuError;
+            }
+            appendLocalLog(
+              `[${file.name}] GPU output unreliable (mostly empty). Falling back to local CPU (${cpuFallbackModelId}).`,
+            );
+            perFileResult = await transcribeDecodedFileWithLocalWorkers({
+              fileName: file.name,
+              samples: decoded.samples,
+              sampleRate: decoded.sampleRate,
+              modelId: cpuFallbackModelId,
+              language: config.language as TranscriptionLanguage,
+              engineLabel: "local-cpu",
+              onProgress: (fileProgress) => {
+                const bounded = Math.max(0, Math.min(100, fileProgress));
+                const progressBase = (index / totalFiles) * 100;
+                const progressSpan = 100 / totalFiles;
+                updateLocalProgress(Math.floor(progressBase + (bounded / 100) * progressSpan));
+              },
+            });
+          }
+        } else {
+          perFileResult = await transcribeDecodedFileWithLocalWorkers({
+            fileName: file.name,
+            samples: decoded.samples,
+            sampleRate: decoded.sampleRate,
+            modelId,
+            language: config.language as TranscriptionLanguage,
+            engineLabel,
+            onProgress: (fileProgress) => {
+              const bounded = Math.max(0, Math.min(100, fileProgress));
+              const progressBase = (index / totalFiles) * 100;
+              const progressSpan = 100 / totalFiles;
+              updateLocalProgress(Math.floor(progressBase + (bounded / 100) * progressSpan));
+            },
+          });
+        }
 
         outputParts.push(`# ${file.name}\n\n${perFileResult.text.trim()}`);
         updateLocalProgress(Math.floor(((index + 1) / totalFiles) * 100));
