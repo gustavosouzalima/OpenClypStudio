@@ -546,7 +546,7 @@ export function PixelTranscriptionsShell() {
       modelId,
       sampleRate,
       devicePreference: "webgpu",
-      returnTimestamps: false,
+      returnTimestamps: true,
       onProgress: (progress) => {
         const raw = Math.max(0, Math.min(100, progress.progress || 0));
         const normalized =

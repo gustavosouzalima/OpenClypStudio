@@ -35,6 +35,7 @@ export type WorkerResponse =
 			type: "transcribe-complete";
 			text: string;
 			segments: TranscriptionSegment[];
+			language?: string | null;
 	  }
 	| { type: "transcribe-error"; error: string }
 	| { type: "cancelled" };
@@ -241,12 +242,20 @@ async function handleTranscribe({
 		const inferenceStride = returnTimestamps
 			? DEFAULT_STRIDE_SECONDS
 			: Math.min(DEFAULT_STRIDE_SECONDS, 2);
-		const rawResult = await transcriber(audio, {
+
+		const pipelineOpts: Record<string, unknown> = {
 			chunk_length_s: inferenceChunkLength,
 			stride_length_s: inferenceStride,
-			language: language === "auto" ? undefined : language,
 			return_timestamps: returnTimestamps,
-		});
+		};
+
+		if (language && language !== "auto") {
+			pipelineOpts.language = language;
+		} else {
+			pipelineOpts.task = "transcribe";
+		}
+
+		const rawResult = await transcriber(audio, pipelineOpts);
 		if (timer) {
 			self.clearInterval(timer);
 			timer = null;
@@ -320,6 +329,9 @@ async function handleTranscribe({
 			type: "transcribe-complete",
 			text: result.text,
 			segments,
+			language: typeof (rawResult as Record<string, unknown>)?.language === "string"
+				? (rawResult as Record<string, unknown>).language as string
+				: null,
 		} satisfies WorkerResponse);
 	} catch (error) {
 		if (timer) {
