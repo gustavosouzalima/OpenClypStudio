@@ -1,5 +1,6 @@
 """Carregamento do modelo Whisper e transcrição via faster-whisper."""
 
+import os
 import warnings
 import logging
 
@@ -30,6 +31,11 @@ except ImportError:
 _model_cache: dict = {}
 _batched_cache: dict = {}
 
+# Threads for CTranslate2 on CPU (0 = all available cores)
+_CPU_THREADS = int(os.getenv("PIXEL_CPU_THREADS", "0"))
+# Number of parallel workers for batched inference pipeline
+_NUM_WORKERS = int(os.getenv("PIXEL_NUM_WORKERS", "1"))
+
 
 def get_whisper_model(model_size: str, log_fn=None):
     """Retorna (WhisperModel, BatchedInferencePipeline) para o tamanho solicitado."""
@@ -39,11 +45,21 @@ def get_whisper_model(model_size: str, log_fn=None):
                 log_fn(f"Carregando faster-whisper: {model_size}...")
             device = "cuda" if CUDA_AVAILABLE else "cpu"
             compute_type = "float16" if CUDA_AVAILABLE else "int8"
-            model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            cpu_threads = _CPU_THREADS if device == "cpu" else 0
+            model = WhisperModel(
+                model_size,
+                device=device,
+                compute_type=compute_type,
+                cpu_threads=cpu_threads,
+                num_workers=_NUM_WORKERS,
+            )
             _model_cache[model_size] = model
             _batched_cache[model_size] = BatchedInferencePipeline(model=model)
             if log_fn:
-                log_fn(f"Modelo {model_size} carregado | device={device} | compute={compute_type}")
+                log_fn(
+                    f"Modelo {model_size} carregado | device={device} | "
+                    f"compute={compute_type} | threads={cpu_threads} | workers={_NUM_WORKERS}"
+                )
         except Exception as e:
             if log_fn:
                 log_fn(f"Erro ao carregar modelo: {e}")
