@@ -7,15 +7,24 @@ import wave
 
 
 def convert_to_wav(input_file: str, log_fn=None) -> str | None:
-    """Converte qualquer áudio/vídeo para WAV 16kHz mono. Retorna o caminho do WAV ou None."""
     try:
+        data_dir = os.getenv("PIXEL_DATA_DIR", "").strip()
+        if data_dir:
+            out_dir = os.path.join(data_dir, "wav_temp")
+            os.makedirs(out_dir, exist_ok=True)
+            safe_name = f"transcritor_{os.getpid()}_{os.path.splitext(os.path.basename(input_file))[0]}.wav"
+            out = os.path.join(out_dir, safe_name)
+        else:
+            raise ValueError("No PIXEL_DATA_DIR")
+    except Exception:
         safe_name = f"transcritor_{os.getpid()}_{os.path.splitext(os.path.basename(input_file))[0]}.wav"
         out = os.path.join(tempfile.gettempdir(), safe_name)
-        cmd = [
-            'ffmpeg', '-threads', '0', '-i', input_file,
-            '-vn', '-sn', '-dn',
-            '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', '-y', out
-        ]
+    cmd = [
+        'ffmpeg', '-threads', '0', '-i', input_file,
+        '-vn', '-sn', '-dn',
+        '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', '-y', out
+    ]
+    try:
         subprocess.run(cmd, check=True, capture_output=True, timeout=3600)
         return out
     except subprocess.TimeoutExpired:
