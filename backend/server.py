@@ -214,11 +214,13 @@ TRANSCRIBE_MAX_BATCH_SIZE_GPU = _env_int("PIXEL_MAX_BATCH_SIZE_GPU", 32, min_val
 TRANSCRIBE_FORCE_CPU_SAFE_MODEL = _env_bool("PIXEL_FORCE_CPU_SAFE_MODEL", True)
 TRANSCRIBE_CPU_SAFE_MODEL = os.getenv("PIXEL_CPU_SAFE_MODEL", "medium").strip() or "medium"
 CPU_HEAVY_WHISPER_MODELS = {"large", "large-v1", "large-v2", "large-v3", "large-v3-turbo"}
+DEFAULT_BEAM_SIZE = _env_int("PIXEL_DEFAULT_BEAM_SIZE", 1, min_value=1)
 
 logger.info(
-    "Transcription defaults: model=%s, batch=%d, max_batch_cpu=%d, force_cpu_safe=%s, cpu_safe_model=%s",
+    "Transcription defaults: model=%s, batch=%d, beam=%d, max_batch_cpu=%d, force_cpu_safe=%s, cpu_safe_model=%s",
     DEFAULT_TRANSCRIBE_MODEL,
     DEFAULT_TRANSCRIBE_BATCH_SIZE,
+    DEFAULT_BEAM_SIZE,
     TRANSCRIBE_MAX_BATCH_SIZE_CPU,
     TRANSCRIBE_FORCE_CPU_SAFE_MODEL,
     TRANSCRIBE_CPU_SAFE_MODEL,
@@ -1240,7 +1242,7 @@ async def transcribe_editor_audio(
     audio_file: UploadFile,
     model: str = Form(default=DEFAULT_TRANSCRIBE_MODEL),
     language: str = Form(default="auto"),
-    beam_size: int = Form(default=5),
+    beam_size: int = Form(default=DEFAULT_BEAM_SIZE),
     batch_size: int = Form(default=DEFAULT_TRANSCRIBE_BATCH_SIZE),
     _: None = Depends(_require_api_key),
 ):
@@ -1375,7 +1377,7 @@ class TranscribeUrlRequest(BaseModel):
     audio_only: bool = True
     model: str = DEFAULT_TRANSCRIBE_MODEL
     language: str = "pt"
-    beam_size: int = 5
+    beam_size: int = DEFAULT_BEAM_SIZE
     batch_size: int = DEFAULT_TRANSCRIBE_BATCH_SIZE
     diarize: bool = False
     num_speakers: int = 2
@@ -1388,7 +1390,7 @@ class TranscribeRequest(BaseModel):
     files: list[str] = Field(default_factory=list)
     model: str = DEFAULT_TRANSCRIBE_MODEL
     language: str = "pt"
-    beam_size: int = 5
+    beam_size: int = DEFAULT_BEAM_SIZE
     batch_size: int = DEFAULT_TRANSCRIBE_BATCH_SIZE
     diarize: bool = False
     num_speakers: int = 2
@@ -1412,7 +1414,7 @@ class AddVideoRequest(BaseModel):
 class ProcessProjectRequest(BaseModel):
     model: str = DEFAULT_TRANSCRIBE_MODEL
     language: str = "auto"
-    beam_size: int = 5
+    beam_size: int = DEFAULT_BEAM_SIZE
     batch_size: int = DEFAULT_TRANSCRIBE_BATCH_SIZE
     diarize: bool = False
 
