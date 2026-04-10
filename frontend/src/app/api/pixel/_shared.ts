@@ -1,6 +1,14 @@
 const DEFAULT_PIXEL_API_BASE_URL = "http://127.0.0.1:8000";
 const LOCAL_FALLBACK_PIXEL_API_BASE_URL = "http://127.0.0.1:8010";
 
+export function getPixelApiKey() {
+  return (
+    process.env.PIXEL_API_KEY?.trim() ||
+    process.env.NEXT_PUBLIC_PIXEL_API_KEY?.trim() ||
+    ""
+  );
+}
+
 export function getPixelApiBaseUrl() {
   const envValue = process.env.NEXT_PUBLIC_PIXEL_API_BASE_URL?.trim();
   if (envValue) return envValue.replace(/\/$/, "");
@@ -20,14 +28,21 @@ export async function proxyPixel(
   init?: RequestInit
 ): Promise<Response> {
   const baseUrls = getPixelApiBaseUrls();
+  const apiKey = getPixelApiKey();
   let lastError: unknown;
 
   for (const baseUrl of baseUrls) {
     const upstream = `${baseUrl}${path}`;
 
     try {
+      const headers = new Headers(init?.headers);
+      if (apiKey && !headers.has("x-api-key")) {
+        headers.set("x-api-key", apiKey);
+      }
+
       const response = await fetch(upstream, {
         ...init,
+        headers,
         cache: "no-store"
       });
 

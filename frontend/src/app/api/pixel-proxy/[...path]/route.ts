@@ -1,4 +1,4 @@
-import { getPixelApiBaseUrls } from "@/app/api/pixel/_shared";
+import { getPixelApiBaseUrls, getPixelApiKey } from "@/app/api/pixel/_shared";
 
 function buildUpstreamUrl(baseUrl: string, path: string[], requestUrl: string) {
   const upstreamUrl = new URL(requestUrl);
@@ -15,6 +15,10 @@ async function proxyRequest(
   const { path } = await context.params;
   const headers = new Headers(request.headers);
   headers.delete("host");
+  const apiKey = getPixelApiKey();
+  if (apiKey && !headers.has("x-api-key")) {
+    headers.set("x-api-key", apiKey);
+  }
 
   const init: RequestInit = {
     method: request.method,
