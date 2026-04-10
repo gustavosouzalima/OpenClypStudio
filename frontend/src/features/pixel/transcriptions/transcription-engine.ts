@@ -107,10 +107,14 @@ export function mapServerModelToLocalModel({
 
 	if (normalized === "tiny") return "whisper-tiny";
 	if (normalized === "base" || normalized === "small") return "whisper-small";
-	if (normalized === "medium") return "whisper-medium";
+	if (normalized === "medium") {
+		return "whisper-small";
+	}
 	if (normalized === "large-v3-turbo" || normalized === "large-v3") {
-		return engine === "local-gpu" ? "whisper-large-v3-turbo" : "whisper-medium";
+		// Browser local mode prioritizes speed/stability over maximum quality.
+		// Backend keeps full large models for best quality.
+		return "whisper-small";
 	}
 
-	return engine === "local-gpu" ? "whisper-large-v3-turbo" : "whisper-small";
+	return "whisper-small";
 }

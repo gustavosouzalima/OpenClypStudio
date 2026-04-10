@@ -3,6 +3,31 @@ export interface DecodedAudioBuffer {
 	sampleRate: number;
 }
 
+function resampleLinear({
+	input,
+	sourceRate,
+	targetRate,
+}: {
+	input: Float32Array;
+	sourceRate: number;
+	targetRate: number;
+}): Float32Array {
+	if (sourceRate === targetRate) return input;
+	const ratio = sourceRate / targetRate;
+	const outputLength = Math.max(1, Math.floor(input.length / ratio));
+	const output = new Float32Array(outputLength);
+
+	for (let i = 0; i < outputLength; i += 1) {
+		const sourcePosition = i * ratio;
+		const left = Math.floor(sourcePosition);
+		const right = Math.min(left + 1, input.length - 1);
+		const frac = sourcePosition - left;
+		output[i] = input[left] * (1 - frac) + input[right] * frac;
+	}
+
+	return output;
+}
+
 function createAudioContext(): AudioContext {
 	const AudioContextCtor =
 		window.AudioContext ||
@@ -18,6 +43,7 @@ function createAudioContext(): AudioContext {
 
 export async function decodeAudioBlobToMonoFloat32(
 	audioBlob: Blob,
+	{ targetSampleRate = 16000 }: { targetSampleRate?: number } = {},
 ): Promise<DecodedAudioBuffer> {
 	const audioContext = createAudioContext();
 	try {
@@ -35,9 +61,16 @@ export async function decodeAudioBlobToMonoFloat32(
 			monoSamples[i] = sum / numChannels;
 		}
 
+		const safeTargetRate = Math.max(8000, Math.floor(targetSampleRate));
+		const outputSamples = resampleLinear({
+			input: monoSamples,
+			sourceRate: decoded.sampleRate,
+			targetRate: safeTargetRate,
+		});
+
 		return {
-			samples: monoSamples,
-			sampleRate: decoded.sampleRate,
+			samples: outputSamples,
+			sampleRate: safeTargetRate,
 		};
 	} catch (error) {
 		throw new Error(

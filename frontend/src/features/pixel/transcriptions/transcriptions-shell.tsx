@@ -28,8 +28,8 @@ import {
   CheckCircle,
   AlertCircle,
 } from "lucide-react";
-import { transcriptionService } from "@/services/transcription/service";
-import type { TranscriptionLanguage } from "@/types/transcription";
+import { TranscriptionService } from "@/services/transcription/service";
+import type { TranscriptionLanguage, TranscriptionModelId } from "@/types/transcription";
 import {
   detectBrowserTranscriptionCapabilities,
   mapServerModelToLocalModel,
@@ -62,10 +62,21 @@ const LANGUAGES = [
 ];
 
 const BEAM_SIZES = [1, 2, 3, 5, 8, 10];
+const LOCAL_CHUNK_SECONDS = 75;
+const LOCAL_CHUNK_OVERLAP_SECONDS = 1;
+const LOCAL_MAX_PARALLEL_WORKERS = 2;
 
 type Tab = "upload" | "url";
 
 const ENGINE_STORAGE_KEY = "pixel.transcription.engine.preference";
+
+type LocalChunkTask = {
+  index: number;
+  startSample: number;
+  endSample: number;
+  startSeconds: number;
+  keepAfterSeconds: number;
+};
 
 const ENGINE_OPTIONS: Array<{
   value: TranscriptionEnginePreference;
@@ -98,6 +109,7 @@ export function PixelTranscriptionsShell() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const localCancelledRef = useRef(false);
+  const localServicesRef = useRef<TranscriptionService[]>([]);
   const transcriptionStartedAtRef = useRef<number | null>(null);
 
   // State
@@ -154,6 +166,13 @@ export function PixelTranscriptionsShell() {
     window.localStorage.setItem(ENGINE_STORAGE_KEY, enginePreference);
   }, [enginePreference]);
 
+  useEffect(() => {
+    return () => {
+      localServicesRef.current.forEach((service) => service.terminate());
+      localServicesRef.current = [];
+    };
+  }, []);
+
   const resolvedEngine = useMemo(
     () =>
       resolveTranscriptionEngine({
@@ -177,7 +196,7 @@ export function PixelTranscriptionsShell() {
       }
       return {
         ...current,
-        logs: [...current.logs, totalLabel].slice(-80),
+        logs: [...current.logs, totalLabel],
       };
     });
     transcriptionStartedAtRef.current = null;
@@ -311,7 +330,7 @@ export function PixelTranscriptionsShell() {
       if (!current) return current;
       return {
         ...current,
-        logs: [...current.logs, message].slice(-80),
+        logs: [...current.logs, message],
       };
     });
   };
@@ -324,6 +343,239 @@ export function PixelTranscriptionsShell() {
         progress: Math.max(0, Math.min(100, value)),
       };
     });
+  };
+
+  const buildLocalChunks = ({
+    totalSamples,
+    sampleRate,
+  }: {
+    totalSamples: number;
+    sampleRate: number;
+  }): LocalChunkTask[] => {
+    const chunkSizeSamples = Math.max(1, Math.floor(LOCAL_CHUNK_SECONDS * sampleRate));
+    const overlapSamples = Math.max(0, Math.floor(LOCAL_CHUNK_OVERLAP_SECONDS * sampleRate));
+    const chunks: LocalChunkTask[] = [];
+
+    let startSample = 0;
+    let index = 0;
+    while (startSample < totalSamples) {
+      const endSample = Math.min(totalSamples, startSample + chunkSizeSamples + overlapSamples);
+      const startSeconds = startSample / sampleRate;
+      chunks.push({
+        index,
+        startSample,
+        endSample,
+        startSeconds,
+        keepAfterSeconds: index === 0 ? 0 : startSeconds + LOCAL_CHUNK_OVERLAP_SECONDS,
+      });
+      startSample += chunkSizeSamples;
+      index += 1;
+    }
+
+    return chunks;
+  };
+
+  const resolveLocalWorkerCount = (engineLabel: "local-gpu" | "local-cpu") => {
+    if (engineLabel === "local-gpu") return 1;
+    const hasEnoughMemory =
+      capabilities.deviceMemoryGb !== null ? capabilities.deviceMemoryGb >= 8 : false;
+    const hasEnoughCores = capabilities.logicalCores >= 8;
+    if (hasEnoughMemory && hasEnoughCores) return LOCAL_MAX_PARALLEL_WORKERS;
+    return 1;
+  };
+
+  const transcribeDecodedFileWithLocalWorkers = async ({
+    fileName,
+    samples,
+    sampleRate,
+    modelId,
+    language,
+    engineLabel,
+    onProgress,
+  }: {
+    fileName: string;
+    samples: Float32Array;
+    sampleRate: number;
+    modelId: TranscriptionModelId;
+    language: TranscriptionLanguage;
+    engineLabel: "local-gpu" | "local-cpu";
+    onProgress: (progress: number) => void;
+  }): Promise<{ text: string; segments: number }> => {
+    const chunks: LocalChunkTask[] =
+      engineLabel === "local-gpu"
+        ? [
+            {
+              index: 0,
+              startSample: 0,
+              endSample: samples.length,
+              startSeconds: 0,
+              keepAfterSeconds: 0,
+            },
+          ]
+        : buildLocalChunks({
+            totalSamples: samples.length,
+            sampleRate,
+          });
+    const workerCount = Math.min(resolveLocalWorkerCount(engineLabel), chunks.length);
+    const services = Array.from({ length: Math.max(1, workerCount) }, () => new TranscriptionService());
+    localServicesRef.current = services;
+
+    appendLocalLog(
+      `[${fileName}] chunking: ${chunks.length} chunk(s), workers=${services.length}, chunk=${LOCAL_CHUNK_SECONDS}s overlap=${LOCAL_CHUNK_OVERLAP_SECONDS}s`,
+    );
+
+    const chunkProgress = new Map<number, number>();
+    const chunkResults = new Map<number, { text: string; segments: Array<{ text: string; start: number; end: number }> }>();
+    let nextChunkIndex = 0;
+
+    const updateOverallProgress = () => {
+      let sum = 0;
+      for (const chunk of chunks) {
+        sum += chunkProgress.get(chunk.index) ?? 0;
+      }
+      onProgress(Math.floor(sum / chunks.length));
+    };
+
+    const runWorker = async (workerIndex: number, service: TranscriptionService) => {
+      while (!localCancelledRef.current) {
+        const queueIndex = nextChunkIndex;
+        nextChunkIndex += 1;
+        if (queueIndex >= chunks.length) break;
+
+        const chunk = chunks[queueIndex];
+        appendLocalLog(
+          `[${fileName}] worker-${workerIndex + 1} -> chunk ${chunk.index + 1}/${chunks.length}`,
+        );
+
+        const chunkAudio = samples.subarray(chunk.startSample, chunk.endSample);
+        chunkProgress.set(chunk.index, 0);
+        updateOverallProgress();
+
+        const result = await service.transcribe({
+          audioData: chunkAudio,
+          language,
+          modelId,
+          sampleRate,
+          devicePreference: engineLabel === "local-gpu" ? "webgpu" : "wasm",
+          onProgress: (progress) => {
+            const raw = Math.max(0, Math.min(100, progress.progress || 0));
+            const normalized =
+              progress.status === "loading-model"
+                ? Math.floor(raw * 0.15)
+                : 15 + Math.floor(raw * 0.85);
+            const current = chunkProgress.get(chunk.index) ?? 0;
+            chunkProgress.set(chunk.index, Math.max(current, normalized));
+            updateOverallProgress();
+          },
+          onLog: (message) => {
+            appendLocalLog(`[${fileName}] worker-${workerIndex + 1} ${message}`);
+          },
+        });
+
+        const shiftedSegments = result.segments.map((segment) => ({
+          text: segment.text,
+          start: segment.start + chunk.startSeconds,
+          end: segment.end + chunk.startSeconds,
+        }));
+
+        chunkResults.set(chunk.index, {
+          text: result.text,
+          segments: shiftedSegments,
+        });
+        chunkProgress.set(chunk.index, 100);
+        updateOverallProgress();
+      }
+    };
+
+    try {
+      await Promise.all(services.map((service, index) => runWorker(index, service)));
+    } finally {
+      services.forEach((service) => service.terminate());
+      localServicesRef.current = [];
+    }
+
+    if (localCancelledRef.current) {
+      throw new Error("Transcription was cancelled");
+    }
+
+    const mergedSegments: Array<{ text: string; start: number; end: number }> = [];
+    const orderedChunkIndexes = [...chunkResults.keys()].sort((a, b) => a - b);
+    for (const chunkIndex of orderedChunkIndexes) {
+      const chunk = chunks[chunkIndex];
+      const chunkOutput = chunkResults.get(chunkIndex);
+      if (!chunkOutput) continue;
+      for (const segment of chunkOutput.segments) {
+        if (chunkIndex > 0 && segment.end <= chunk.keepAfterSeconds + 0.01) {
+          continue;
+        }
+        mergedSegments.push(segment);
+      }
+    }
+
+    const text = mergedSegments.map((segment) => segment.text.trim()).filter(Boolean).join(" ");
+    return {
+      text,
+      segments: mergedSegments.length,
+    };
+  };
+
+  const transcribeDecodedFileDirectGpu = async ({
+    service,
+    fileName,
+    samples,
+    sampleRate,
+    modelId,
+    language,
+    onProgress,
+  }: {
+    service: TranscriptionService;
+    fileName: string;
+    samples: Float32Array;
+    sampleRate: number;
+    modelId: TranscriptionModelId;
+    language: TranscriptionLanguage;
+    onProgress: (progress: number) => void;
+  }): Promise<{ text: string; segments: number }> => {
+    let highestProgress = 0;
+
+    appendLocalLog(`[${fileName}] direct GPU transcription started`);
+
+    const result = await service.transcribe({
+      audioData: samples,
+      language,
+      modelId,
+      sampleRate,
+      devicePreference: "webgpu",
+      returnTimestamps: false,
+      onProgress: (progress) => {
+        const raw = Math.max(0, Math.min(100, progress.progress || 0));
+        const normalized =
+          progress.status === "loading-model"
+            ? Math.floor(raw * 0.15)
+            : 15 + Math.floor(raw * 0.85);
+        highestProgress = Math.max(highestProgress, normalized);
+        onProgress(highestProgress);
+      },
+      // Keep logs concise in GPU direct mode.
+      onLog: (message) => {
+        if (
+          message.startsWith("worker:init-start") ||
+          message.startsWith("worker:init-complete") ||
+          message.startsWith("worker:transcribe-start") ||
+          message.startsWith("worker:transcribe-running") ||
+          message.startsWith("worker:transcribe-complete") ||
+          message.startsWith("transcribe:error")
+        ) {
+          appendLocalLog(`[${fileName}] ${message}`);
+        }
+      },
+    });
+
+    onProgress(100);
+    return {
+      text: result.text,
+      segments: result.segments.length,
+    };
   };
 
   const startServerTranscription = async () => {
@@ -346,13 +598,16 @@ export function PixelTranscriptionsShell() {
 
   const startLocalTranscription = async (engineLabel: "local-gpu" | "local-cpu") => {
     const localJobId = `local-${crypto.randomUUID()}`;
-    const modelId = mapServerModelToLocalModel({
+    const mappedModelId = mapServerModelToLocalModel({
       serverModel: config.model,
       engine: engineLabel,
     });
+    const modelId = mappedModelId;
     const totalFiles = selectedFiles.length;
     const outputParts: string[] = [];
     localCancelledRef.current = false;
+    const sharedGpuService = engineLabel === "local-gpu" ? new TranscriptionService() : null;
+    localServicesRef.current = sharedGpuService ? [sharedGpuService] : [];
 
     setActiveJob({
       job_id: localJobId,
@@ -361,46 +616,83 @@ export function PixelTranscriptionsShell() {
       logs: [
         `Using local engine (${engineLabel === "local-gpu" ? "GPU" : "CPU"})`,
         `Model: ${modelId}`,
+        `Requested files: ${selectedFiles.length}`,
       ],
     });
+    if (
+      engineLabel === "local-gpu" &&
+      (config.model === "large-v3-turbo" || config.model === "large-v3") &&
+      modelId !== "whisper-large-v3-turbo"
+    ) {
+      appendLocalLog(
+        "Local GPU speed profile enabled: using lighter browser model for better throughput.",
+      );
+    }
+    try {
+      for (let index = 0; index < totalFiles; index += 1) {
+        if (localCancelledRef.current) {
+          setActiveJob((current) =>
+            current
+              ? {
+                  ...current,
+                  status: "cancelled",
+                  cancelled: true,
+                  progress: Math.max(current.progress, 1),
+                }
+              : current,
+          );
+          setIsTranscribing(false);
+          markTranscriptionFinished();
+          return;
+        }
 
-    for (let index = 0; index < totalFiles; index += 1) {
-      if (localCancelledRef.current) {
-        setActiveJob((current) =>
-          current
-            ? {
-                ...current,
-                status: "cancelled",
-                cancelled: true,
-                progress: Math.max(current.progress, 1),
-              }
-            : current,
+        const file = selectedFiles[index];
+        appendLocalLog(`Decoding ${file.name} (${index + 1}/${totalFiles})...`);
+        const decoded = await decodeAudioBlobToMonoFloat32(file, { targetSampleRate: 16000 });
+        appendLocalLog(
+          `[${file.name}] decoded sampleRate=${decoded.sampleRate}Hz samples=${decoded.samples.length}`,
         );
-        setIsTranscribing(false);
-        markTranscriptionFinished();
-        return;
+
+        const perFileResult =
+          engineLabel === "local-gpu"
+            ? await transcribeDecodedFileDirectGpu({
+                service: sharedGpuService as TranscriptionService,
+                fileName: file.name,
+                samples: decoded.samples,
+                sampleRate: decoded.sampleRate,
+                modelId,
+                language: config.language as TranscriptionLanguage,
+                onProgress: (fileProgress) => {
+                  const bounded = Math.max(0, Math.min(100, fileProgress));
+                  const progressBase = (index / totalFiles) * 100;
+                  const progressSpan = 100 / totalFiles;
+                  updateLocalProgress(Math.floor(progressBase + (bounded / 100) * progressSpan));
+                },
+              })
+            : await transcribeDecodedFileWithLocalWorkers({
+                fileName: file.name,
+                samples: decoded.samples,
+                sampleRate: decoded.sampleRate,
+                modelId,
+                language: config.language as TranscriptionLanguage,
+                engineLabel,
+                onProgress: (fileProgress) => {
+                  const bounded = Math.max(0, Math.min(100, fileProgress));
+                  const progressBase = (index / totalFiles) * 100;
+                  const progressSpan = 100 / totalFiles;
+                  updateLocalProgress(Math.floor(progressBase + (bounded / 100) * progressSpan));
+                },
+              });
+
+        outputParts.push(`# ${file.name}\n\n${perFileResult.text.trim()}`);
+        updateLocalProgress(Math.floor(((index + 1) / totalFiles) * 100));
+        appendLocalLog(`Completed ${file.name} (${perFileResult.segments} segments)`);
       }
-
-      const file = selectedFiles[index];
-      appendLocalLog(`Decoding ${file.name} (${index + 1}/${totalFiles})...`);
-      const decoded = await decodeAudioBlobToMonoFloat32(file);
-
-      appendLocalLog(`Transcribing ${file.name}...`);
-      const result = await transcriptionService.transcribe({
-        audioData: decoded.samples,
-        language: config.language as TranscriptionLanguage,
-        modelId,
-        onProgress: (progress) => {
-          const fileProgress = Math.max(0, Math.min(100, progress.progress || 0));
-          const progressBase = (index / totalFiles) * 100;
-          const progressSpan = 100 / totalFiles;
-          updateLocalProgress(Math.floor(progressBase + (fileProgress / 100) * progressSpan));
-        },
-      });
-
-      outputParts.push(`# ${file.name}\n\n${result.text.trim()}`);
-      updateLocalProgress(Math.floor(((index + 1) / totalFiles) * 100));
-      appendLocalLog(`Completed ${file.name} (${result.segments.length} segments)`);
+    } finally {
+      if (sharedGpuService) {
+        sharedGpuService.terminate();
+      }
+      localServicesRef.current = [];
     }
 
     const mergedContent = outputParts.join("\n\n---\n\n");
@@ -453,6 +745,13 @@ export function PixelTranscriptionsShell() {
         await startLocalTranscription(resolvedEngine.engine);
       } catch (localError) {
         console.error("Local transcription failed:", localError);
+        if (
+          localCancelledRef.current ||
+          (localError instanceof Error &&
+            localError.message.toLowerCase().includes("cancelled"))
+        ) {
+          return;
+        }
         if (enginePreference === "auto") {
           await startServerTranscription();
           return;
@@ -483,7 +782,7 @@ export function PixelTranscriptionsShell() {
     if (!activeJob) return;
     if (activeJob.job_id.startsWith("local-")) {
       localCancelledRef.current = true;
-      transcriptionService.cancel();
+      localServicesRef.current.forEach((service) => service.cancel());
       setActiveJob((current) =>
         current
           ? {
@@ -1037,7 +1336,7 @@ export function PixelTranscriptionsShell() {
                 </div>
                 {activeJob.logs?.length ? (
                   <pre className="max-h-40 overflow-auto rounded-lg bg-black px-3 py-3 text-xs text-white">
-                    {activeJob.logs.slice(-10).join("\n")}
+                    {activeJob.logs.join("\n")}
                   </pre>
                 ) : null}
               </CardContent>
@@ -1045,7 +1344,7 @@ export function PixelTranscriptionsShell() {
           )}
 
           {/* Results */}
-          {activeJob?.status === "done" && (
+          {(activeJob?.status === "done" || localTranscript) && (
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">

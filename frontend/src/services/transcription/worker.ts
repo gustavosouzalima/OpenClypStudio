@@ -11,14 +11,25 @@ import {
 } from "@/constants/transcription-constants";
 
 export type WorkerMessage =
-	| { type: "init"; modelId: string }
-	| { type: "transcribe"; audio: Float32Array; language: string }
+	| {
+			type: "init";
+			modelId: string;
+			devicePreference?: "auto" | "webgpu" | "wasm";
+	  }
+	| {
+			type: "transcribe";
+			audio: Float32Array;
+			language: string;
+			sampleRate?: number;
+			returnTimestamps?: boolean;
+	  }
 	| { type: "cancel" };
 
 export type WorkerResponse =
 	| { type: "init-progress"; progress: number }
 	| { type: "init-complete" }
 	| { type: "init-error"; error: string }
+	| { type: "log"; message: string }
 	| { type: "transcribe-progress"; progress: number }
 	| {
 			type: "transcribe-complete";
@@ -38,12 +49,17 @@ self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
 
 	switch (message.type) {
 		case "init":
-			await handleInit({ modelId: message.modelId });
+			await handleInit({
+				modelId: message.modelId,
+				devicePreference: message.devicePreference,
+			});
 			break;
 		case "transcribe":
 			await handleTranscribe({
 				audio: message.audio,
 				language: message.language,
+				sampleRate: message.sampleRate,
+				returnTimestamps: message.returnTimestamps,
 			});
 			break;
 		case "cancel":
@@ -53,8 +69,14 @@ self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
 	}
 };
 
-async function handleInit({ modelId }: { modelId: string }) {
-	console.log("[worker] handleInit called with modelId:", modelId);
+async function handleInit({
+	modelId,
+	devicePreference,
+}: {
+	modelId: string;
+	devicePreference?: "auto" | "webgpu" | "wasm";
+}) {
+	console.log("[worker] handleInit called with modelId:", modelId, "devicePreference:", devicePreference);
 	lastReportedProgress = -1;
 	fileBytes.clear();
 
@@ -70,15 +92,26 @@ async function handleInit({ modelId }: { modelId: string }) {
 			);
 		}
 
+		const hasWebGpu = Boolean((self as unknown as { navigator?: { gpu?: unknown } }).navigator?.gpu);
+		if (devicePreference === "webgpu" && !hasWebGpu) {
+			throw new Error("WebGPU is not available in this browser/runtime.");
+		}
+		const device: "webgpu" | "wasm" =
+			devicePreference === "wasm" ? "wasm" : hasWebGpu ? "webgpu" : "wasm";
+
+		const dtype = device === "webgpu" ? "fp16" : "q4";
+
 		console.log("[worker] Loading model:", {
 			modelId: model.id,
 			modelName: model.name,
 			huggingFaceId: model.huggingFaceId,
+			device,
+			dtype,
 		});
 
 		transcriber = (await pipeline("automatic-speech-recognition", model.huggingFaceId, {
-			dtype: "q4",
-			device: "auto",
+			dtype,
+			device,
 			progress_callback: (progressInfo: {
 				status?: string;
 				file?: string;
@@ -141,13 +174,18 @@ async function handleInit({ modelId }: { modelId: string }) {
 async function handleTranscribe({
 	audio,
 	language,
+	sampleRate,
+	returnTimestamps = true,
 }: {
 	audio: Float32Array;
 	language: string;
+	sampleRate?: number;
+	returnTimestamps?: boolean;
 }) {
 	console.log("[worker] handleTranscribe called:", {
 		audioLength: audio.length,
 		language,
+		sampleRate,
 	});
 
 	if (!transcriber) {
@@ -159,15 +197,60 @@ async function handleTranscribe({
 	}
 
 	cancelled = false;
+	let timer: number | null = null;
 
 	try {
+		const effectiveSampleRate = sampleRate && sampleRate > 0 ? sampleRate : 44100;
+		const durationSeconds = audio.length / effectiveSampleRate;
+		let syntheticProgress = 0;
+		const estimatedMs = Math.max(15000, durationSeconds * 900);
+		const startedAt = Date.now();
+		let lastHeartbeatMs = 0;
+
+		self.postMessage({
+			type: "log",
+			message: `worker:transcribe-start duration=${durationSeconds.toFixed(1)}s`,
+		} satisfies WorkerResponse);
+
+		timer = self.setInterval(() => {
+			if (cancelled) return;
+			const elapsedMs = Date.now() - startedAt;
+			const ratio = Math.min(elapsedMs / estimatedMs, 1);
+			const nextProgress = Math.min(95, Math.max(1, Math.floor(ratio * 95)));
+			if (nextProgress > syntheticProgress) {
+				syntheticProgress = nextProgress;
+				self.postMessage({
+					type: "transcribe-progress",
+					progress: syntheticProgress,
+				} satisfies WorkerResponse);
+			}
+
+			if (elapsedMs - lastHeartbeatMs >= 15000) {
+				lastHeartbeatMs = elapsedMs;
+				self.postMessage({
+					type: "log",
+					message: `worker:transcribe-running elapsed=${Math.floor(elapsedMs / 1000)}s progress=${syntheticProgress}%`,
+				} satisfies WorkerResponse);
+			}
+		}, 1200);
+
 		console.log("[worker] Starting transcription with Whisper pipeline...");
+		const inferenceChunkLength = returnTimestamps
+			? DEFAULT_CHUNK_LENGTH_SECONDS
+			: Math.max(DEFAULT_CHUNK_LENGTH_SECONDS, 60);
+		const inferenceStride = returnTimestamps
+			? DEFAULT_STRIDE_SECONDS
+			: Math.min(DEFAULT_STRIDE_SECONDS, 2);
 		const rawResult = await transcriber(audio, {
-			chunk_length_s: DEFAULT_CHUNK_LENGTH_SECONDS,
-			stride_length_s: DEFAULT_STRIDE_SECONDS,
+			chunk_length_s: inferenceChunkLength,
+			stride_length_s: inferenceStride,
 			language: language === "auto" ? undefined : language,
-			return_timestamps: true,
+			return_timestamps: returnTimestamps,
 		});
+		if (timer) {
+			self.clearInterval(timer);
+			timer = null;
+		}
 
 		const result: AutomaticSpeechRecognitionOutput = Array.isArray(rawResult)
 			? rawResult[0]
@@ -183,6 +266,10 @@ async function handleTranscribe({
 
 		if (cancelled) {
 			console.log("[worker] Transcription cancelled");
+			self.postMessage({
+				type: "log",
+				message: "worker:transcribe-cancelled",
+			} satisfies WorkerResponse);
 			return;
 		}
 
@@ -214,8 +301,20 @@ async function handleTranscribe({
 		});
 
 		if (segments.length === 0) {
-			throw new Error("No valid segments generated from transcription - audio may be too short or silent");
+			segments.push({
+				text: result.text,
+				start: 0,
+				end: durationSeconds,
+			});
 		}
+		self.postMessage({
+			type: "transcribe-progress",
+			progress: 100,
+		} satisfies WorkerResponse);
+		self.postMessage({
+			type: "log",
+			message: `worker:transcribe-complete segments=${segments.length}`,
+		} satisfies WorkerResponse);
 
 		self.postMessage({
 			type: "transcribe-complete",
@@ -223,8 +322,16 @@ async function handleTranscribe({
 			segments,
 		} satisfies WorkerResponse);
 	} catch (error) {
+		if (timer) {
+			self.clearInterval(timer);
+			timer = null;
+		}
 		if (cancelled) return;
 		console.error("[worker] Transcription failed:", error);
+		self.postMessage({
+			type: "log",
+			message: `worker:transcribe-failed ${error instanceof Error ? error.message : "unknown error"}`,
+		} satisfies WorkerResponse);
 		self.postMessage({
 			type: "transcribe-error",
 			error: error instanceof Error ? error.message : "Transcription failed - see console for details",
