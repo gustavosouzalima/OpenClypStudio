@@ -108,7 +108,7 @@ bun run frontend:dev   # Next.js on :3000
 
 ## Production Deployment (Docker)
 
-Runs both backend and frontend on a single VPS. The backend is only accessible internally through the Docker network.
+Runs backend + frontend on a VPS. Backend stays internal in Docker network and frontend is exposed through an existing Traefik proxy.
 
 ### 1. Clone and configure
 
@@ -116,13 +116,31 @@ Runs both backend and frontend on a single VPS. The backend is only accessible i
 git clone <your-repo-url> && cd openclypstudio
 
 cp .env.openclyp.example .env.openclyp
-# Edit .env.openclyp — set SESSION_SECRET and ADMIN_PASSWORD
+# Edit .env.openclyp
 ```
 
-Generate a session secret:
+Generate strong secrets:
 
 ```bash
 openssl rand -hex 32
+```
+
+Set at minimum:
+
+- `NEXT_PUBLIC_SITE_URL`
+- `SESSION_SECRET`
+- `ADMIN_PASSWORD`
+- `BETTER_AUTH_SECRET`
+- `PIXEL_API_KEY`
+- `TRAEFIK_HOST`
+- `TRAEFIK_ENTRYPOINT`
+- `TRAEFIK_CERTRESOLVER`
+- `TRAEFIK_DOCKER_NETWORK`
+
+Find your Traefik Docker network name (example with `root-traefik-1`):
+
+```bash
+docker inspect root-traefik-1 --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}'
 ```
 
 ### 2. Deploy
@@ -131,26 +149,24 @@ openssl rand -hex 32
 docker compose -f docker-compose.openclyp.yml --env-file .env.openclyp up -d --build
 ```
 
-The app will be available at `http://<your-vps-ip>:4711`.
+Then check status/logs:
 
-### 3. Reverse proxy (recommended)
-
-Place Nginx or Caddy in front for HTTPS:
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name your-domain.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:4711;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-    }
-}
+```bash
+docker compose -f docker-compose.openclyp.yml --env-file .env.openclyp ps
+docker compose -f docker-compose.openclyp.yml --env-file .env.openclyp logs -f frontend
+docker compose -f docker-compose.openclyp.yml --env-file .env.openclyp logs -f backend
 ```
+
+### 3. Traefik integration (existing VPS proxy)
+
+`docker-compose.openclyp.yml` is already configured for Traefik labels and does not bind host ports `80/443`.
+Your existing Traefik should route by host rule to the frontend service.
+
+Notes:
+
+- Keep `TRAEFIK_DOCKER_NETWORK` equal to the real external Traefik network.
+- If your Traefik resolver name is `mytlschallenge`, set `TRAEFIK_CERTRESOLVER=mytlschallenge`.
+- Do not run another reverse proxy container for this stack on ports `80/443`.
 
 ## Environment Variables
 
@@ -161,7 +177,12 @@ See `.env.openclyp.example` for all variables:
 | `NEXT_PUBLIC_SITE_URL` | Public URL of the app | Yes |
 | `SESSION_SECRET` | Signs session cookies (use `openssl rand -hex 32`) | Yes |
 | `ADMIN_PASSWORD` | Workspace access password | Yes |
-| `PIXEL_API_KEY` | Optional — protects backend API endpoints | No |
+| `BETTER_AUTH_SECRET` | Better Auth secret (minimum 32 chars, random) | Yes (production) |
+| `PIXEL_API_KEY` | Protects backend API endpoints | Yes (production) |
+| `TRAEFIK_HOST` | Public domain used by Traefik router rule | Yes (Traefik mode) |
+| `TRAEFIK_ENTRYPOINT` | Traefik entrypoint (`websecure` usually) | Yes (Traefik mode) |
+| `TRAEFIK_CERTRESOLVER` | Traefik cert resolver name | Yes (Traefik mode) |
+| `TRAEFIK_DOCKER_NETWORK` | External Docker network shared with Traefik | Yes (Traefik mode) |
 | `GEMINI_API_KEY` | Optional — AI script generation | No |
 | `OPENAI_API_KEY` | Optional — AI script generation | No |
 

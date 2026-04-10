@@ -112,3 +112,21 @@ Frontend padrao: `http://localhost:3000`
 - Em exemplos/documentacao, usar apenas placeholders (ex.: `troque_por_uma_string_aleatoria_longa`).
 - Se for necessario mostrar logs/comandos, mascarar valores sensiveis (`****`) antes de publicar.
 - Se algum segredo for exposto acidentalmente: rotacionar imediatamente e remover do historico quando aplicavel.
+
+## Deploy em Producao (Traefik)
+
+- Este projeto deve usar o Traefik ja existente no VPS como reverse proxy.
+- Nao publicar portas `80/443` neste stack do OpenClyp.
+- O servico `frontend` deve ser roteado por labels do Traefik e rede Docker externa compartilhada.
+- Variaveis obrigatorias para esse modo: `TRAEFIK_HOST`, `TRAEFIK_ENTRYPOINT`, `TRAEFIK_CERTRESOLVER`, `TRAEFIK_DOCKER_NETWORK`.
+- `TRAEFIK_DOCKER_NETWORK` deve ser o nome real da rede do Traefik no host (ex.: `traefik_public`).
+
+## Operacao de Transcricao
+
+- A API usa `PIXEL_API_KEY` para proteger endpoints de transcricao/processamento; frontend e backend devem usar a mesma chave.
+- Em transcricoes longas, o backend divide audio em chunks automaticamente para reduzir pico de memoria.
+- Ajustes de chunking por ambiente:
+  - `PIXEL_TRANSCRIBE_CHUNK_SECONDS` (padrao `300`)
+  - `PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS` (padrao `1.0`)
+- Arquivos temporarios de audio/chunks sao removidos apos o processamento; o resultado textual permanece salvo.
+- Jobs em memoria podem ser perdidos apos restart do backend; nesse caso o frontend pode receber `404` ao consultar `/api/jobs/{id}` antigo.
