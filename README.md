@@ -183,6 +183,8 @@ See `.env.openclyp.example` for all variables:
 | `TRAEFIK_ENTRYPOINT` | Traefik entrypoint (`websecure` usually) | Yes (Traefik mode) |
 | `TRAEFIK_CERTRESOLVER` | Traefik cert resolver name | Yes (Traefik mode) |
 | `TRAEFIK_DOCKER_NETWORK` | External Docker network shared with Traefik | Yes (Traefik mode) |
+| `PIXEL_BACKEND_CPUS` | CPU limit applied to backend container (compose deploy limit) | Optional |
+| `PIXEL_BACKEND_MEMORY_LIMIT` | Memory limit applied to backend container (compose deploy limit) | Optional |
 | `PIXEL_DEFAULT_WHISPER_MODEL` | Default Whisper model for backend requests | Optional |
 | `PIXEL_DEFAULT_BATCH_SIZE` | Default batch size for backend transcription | Optional |
 | `PIXEL_MAX_BATCH_SIZE_CPU` | Maximum batch size when running on CPU | Optional |

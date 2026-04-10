@@ -40,8 +40,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 10G
-          cpus: "4"
+          memory: "${PIXEL_BACKEND_MEMORY_LIMIT:-10G}"
+          cpus: "${PIXEL_BACKEND_CPUS:-4}"
 
   frontend:
     build:
