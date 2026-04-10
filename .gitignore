@@ -44,6 +44,7 @@ skills-lock.json
 node_modules/
 .bun-install/
 .bun-tmp/
+frontend/.content-collections/
 
 # ── OpenCut legacy (still present in repo) ─────────────
 OpenCut/.bun-install/

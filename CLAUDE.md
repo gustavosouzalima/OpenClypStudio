@@ -103,3 +103,12 @@ Frontend padrao: `http://localhost:3000`
 - Testes backend: `cd backend && python -m pytest -q`
 - Build frontend: `cd frontend && bun run build`
 - O repositorio ainda contem rastros de migracoes anteriores, entao decisoes de limpeza devem ser guiadas por uso real no `frontend/` atual
+
+## Seguranca (Repositorio Publico)
+
+- Este repositorio e publico. Nao expor segredos em nenhum arquivo, commit, issue, PR, log ou resposta.
+- Nunca commitar credenciais reais: `API_KEY`, `SESSION_SECRET`, `BETTER_AUTH_SECRET`, tokens OAuth, senhas, URLs com token, cookies, headers `Authorization`.
+- Nunca commitar `.env`, `.env.local`, dumps de banco, artefatos de producao ou logs com dados sensiveis.
+- Em exemplos/documentacao, usar apenas placeholders (ex.: `troque_por_uma_string_aleatoria_longa`).
+- Se for necessario mostrar logs/comandos, mascarar valores sensiveis (`****`) antes de publicar.
+- Se algum segredo for exposto acidentalmente: rotacionar imediatamente e remover do historico quando aplicavel.

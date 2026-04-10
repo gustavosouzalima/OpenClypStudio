@@ -3,6 +3,7 @@
 AI-powered video editor with automatic transcription, speaker diarization, and timeline-based editing. Designed for content creators who want to produce short-form videos from long-form content — fast.
 
 ![OpenClyp Studio Screenshot](./home.jpeg)
+![OpenClyp Studio Transcriptions](./transcriptions.jpeg)
 
 ## Open Source
 
