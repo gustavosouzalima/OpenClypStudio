@@ -53,15 +53,23 @@ def extract_embeddings(audio_path: str, segments, log_fn=None):
         wav = preprocess_wav(audio_path)
         sr = 16000
         embeddings = []
-        for seg in segments:
-            start = int(seg.start * sr)
-            end = int(seg.end * sr)
-            chunk = wav[start:end]
-            if len(chunk) < 1600:  # < 0.1s — muito curto
-                embeddings.append(None)
-                continue
-            emb = encoder.embed_utterance(chunk)
-            embeddings.append(emb)
+        batch_size = 50  # process in batches to limit peak memory
+        total = len(segments)
+        for batch_start in range(0, total, batch_size):
+            batch_end = min(batch_start + batch_size, total)
+            for seg in segments[batch_start:batch_end]:
+                start = int(seg.start * sr)
+                end = int(seg.end * sr)
+                chunk = wav[start:end]
+                if len(chunk) < 1600:  # < 0.1s — muito curto
+                    embeddings.append(None)
+                    continue
+                emb = encoder.embed_utterance(chunk)
+                embeddings.append(emb)
+            if log_fn and total > batch_size:
+                log_fn(f"  Embeddings: {min(batch_end, total)}/{total}")
+        # Release the full WAV array as soon as possible
+        del wav
         return embeddings
     except Exception as e:
         if log_fn:

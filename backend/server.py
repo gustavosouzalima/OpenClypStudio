@@ -92,6 +92,7 @@ import music_catalog
 import youtube_api
 import tts as tts_module
 import app_settings
+import job_store
 from templates_ia import TEMPLATES, get_system_prompt
 
 # Módulos com imports pesados de ML — carregados apenas no primeiro uso
@@ -102,6 +103,22 @@ def FASTER_WHISPER_AVAILABLE() -> bool:  # noqa: N802
     return tr_module.FASTER_WHISPER_AVAILABLE
 
 logger = logging.getLogger(__name__)
+
+
+def _rss_mb() -> str:
+    """Return current process RSS in MB (best-effort)."""
+    try:
+        import resource
+        rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        return f"{rss_bytes / (1024 * 1024):.0f}MB"
+    except Exception:
+        pass
+    try:
+        import psutil
+        return f"{psutil.Process().memory_info().rss / (1024 * 1024):.0f}MB"
+    except Exception:
+        pass
+    return "?"
 
 EDITOR_PRESETS = {
     "dynamic": {
@@ -156,7 +173,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 COMPILADOS_DIR = DATA_DIR / "compilados"
 COMPILADOS_DIR.mkdir(parents=True, exist_ok=True)
 
-TRANSCRIBE_CHUNK_SECONDS = max(0, int(os.getenv("PIXEL_TRANSCRIBE_CHUNK_SECONDS", "300")))
+TRANSCRIBE_CHUNK_SECONDS = max(0, int(os.getenv("PIXEL_TRANSCRIBE_CHUNK_SECONDS", "120")))
 TRANSCRIBE_CHUNK_OVERLAP_SECONDS = max(0.0, float(os.getenv("PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS", "1.0")))
 
 
@@ -185,8 +202,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 DEFAULT_TRANSCRIBE_MODEL = os.getenv("PIXEL_DEFAULT_WHISPER_MODEL", "medium").strip() or "medium"
-DEFAULT_TRANSCRIBE_BATCH_SIZE = _env_int("PIXEL_DEFAULT_BATCH_SIZE", 8, min_value=1)
-TRANSCRIBE_MAX_BATCH_SIZE_CPU = _env_int("PIXEL_MAX_BATCH_SIZE_CPU", 8, min_value=1)
+DEFAULT_TRANSCRIBE_BATCH_SIZE = _env_int("PIXEL_DEFAULT_BATCH_SIZE", 4, min_value=1)
+TRANSCRIBE_MAX_BATCH_SIZE_CPU = _env_int("PIXEL_MAX_BATCH_SIZE_CPU", 4, min_value=1)
 TRANSCRIBE_MAX_BATCH_SIZE_GPU = _env_int("PIXEL_MAX_BATCH_SIZE_GPU", 32, min_value=1)
 TRANSCRIBE_FORCE_CPU_SAFE_MODEL = _env_bool("PIXEL_FORCE_CPU_SAFE_MODEL", True)
 TRANSCRIBE_CPU_SAFE_MODEL = os.getenv("PIXEL_CPU_SAFE_MODEL", "medium").strip() or "medium"
@@ -339,6 +356,10 @@ def _transcribe_with_optional_chunking(
         if log_fn and len(chunks) > 1:
             log_fn(f"   Chunk {chunk_index + 1}/{len(chunks)}")
 
+        # Free memory from previous chunk before loading the next one.
+        if chunk_index > 0:
+            gc.collect()
+
         segments_gen, info = batched.transcribe(
             chunk_path,
             language=language,
@@ -381,7 +402,12 @@ def _transcribe_with_optional_chunking(
     return segments_list, detected_language, temp_chunk_files
 
 # ── Job Manager ──────────────────────────────────────────────────────────────
-_jobs: dict[str, dict] = {}  # job_id → {status, progress, logs, result, error}
+# _jobs is the in-memory hot cache; job_store provides SQLite persistence so
+# jobs survive backend restarts.  On startup job_store.init() populates its
+# internal cache; we keep _jobs as a *reference* to that cache so every
+# existing read/write goes through the same object.
+job_store.init(DATA_DIR)
+_jobs: dict[str, dict] = job_store._cache  # shared reference
 _ws_queues: dict[str, asyncio.Queue] = {}  # job_id → asyncio.Queue
 _API_KEY = os.getenv("PIXEL_API_KEY", "").strip()
 
@@ -415,9 +441,7 @@ def _require_api_key(
 
 
 def _new_job() -> str:
-    job_id = str(uuid.uuid4())
-    _jobs[job_id] = {"status": "pending", "progress": 0, "logs": [], "result": None, "error": None}
-    return job_id
+    return job_store.new_job()
 
 
 def _job_send(job_id: str, loop: asyncio.AbstractEventLoop, msg: dict) -> None:
@@ -425,6 +449,21 @@ def _job_send(job_id: str, loop: asyncio.AbstractEventLoop, msg: dict) -> None:
     q = _ws_queues.get(job_id)
     if q:
         loop.call_soon_threadsafe(q.put_nowait, msg)
+
+
+def _job_finish(job_id: str, *, status: str, result=None, error: str | None = None) -> None:
+    """Mark a job as done/error in both cache and SQLite."""
+    job = _jobs.get(job_id)
+    if job is None:
+        return
+    job["status"] = status
+    if status == "done":
+        job["progress"] = 100
+    if result is not None:
+        job["result"] = result
+    if error is not None:
+        job["error"] = error
+    job_store.finish(job_id, status=status, result=result, error=error)
 
 
 # ── App ──────────────────────────────────────────────────────────────────────
@@ -441,7 +480,7 @@ app.add_middleware(
 @app.get("/api/jobs/{job_id}")
 async def get_job_status(job_id: str):
     """Retorna o status atual de um job para polling via HTTP."""
-    job = _jobs.get(job_id)
+    job = job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job não encontrado")
     return {**job, "job_id": job_id}
@@ -1504,15 +1543,12 @@ def _run_download_standalone(job_id: str, req: DownloadRequest, loop: asyncio.Ab
             raise RuntimeError("Download did not return a file.")
 
         log(f"✅ Downloaded: {os.path.basename(filepath)}")
-        _jobs[job_id]["status"] = "done"
-        _jobs[job_id]["progress"] = 100
-        _jobs[job_id]["result"] = {"filepath": filepath, "filename": os.path.basename(filepath)}
+        _job_finish(job_id, status="done", result={"filepath": filepath, "filename": os.path.basename(filepath)})
         _job_send(job_id, loop, {"type": "done", "filepath": filepath, "filename": os.path.basename(filepath)})
 
     except Exception as e:
         log(f"❌ Error: {e}")
-        _jobs[job_id]["status"] = "error"
-        _jobs[job_id]["error"] = str(e)
+        _job_finish(job_id, status="error", error=str(e))
         _job_send(job_id, loop, {"type": "error", "message": str(e)})
 
 
@@ -1575,6 +1611,7 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
     source_files_to_cleanup: list[str] = []
 
     try:
+        log(f"[mem] RSS at start: {_rss_mb()}")
         total_files = max(len(req.files), 1)
         model_name, effective_batch_size = _resolve_transcribe_runtime(req.model, req.batch_size, log)
         language = None if req.language == "auto" else req.language
@@ -1638,12 +1675,14 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
                         speaker_map = diarization.cluster_speakers(
                             embeddings, req.num_speakers, req.auto_detect_speakers, log
                         )
+                        del embeddings
                         n_spk = len(set(speaker_map.values())) if speaker_map else 0
                         log(f"✅ {n_spk} speaker(s) identified")
                     else:
                         log("⚠️ Diarization failed — saving without speaker identification")
                 else:
                     log("⚠️ resemblyzer/scikit-learn not installed")
+                gc.collect()
 
             base = os.path.splitext(audio_path)[0]
             suffix = "_with_speakers" if (req.diarize and speaker_map) else "_transcription"
@@ -1671,13 +1710,14 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
 
         progress(100)
         log(f"\n🎉 Transcription complete: {len(saved_outputs)} file(s) generated")
+        log(f"[mem] RSS at end: {_rss_mb()}")
 
-        _jobs[job_id]["status"] = "done"
-        _jobs[job_id]["result"] = {
+        result_data = {
             "job_id": job_id,
             "history_ids": history_ids,
             "files": saved_outputs,
         }
+        _job_finish(job_id, status="done", result=result_data)
         _job_send(job_id, loop, {
             "type": "done",
             "history_ids": history_ids,
@@ -1686,8 +1726,7 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
 
     except Exception as e:
         log(f"❌ Error: {str(e)}")
-        _jobs[job_id]["status"] = "error"
-        _jobs[job_id]["error"] = str(e)
+        _job_finish(job_id, status="error", error=str(e))
         _job_send(job_id, loop, {"type": "error", "message": str(e)})
     finally:
         for temp_file in generated_temp_files:
@@ -1813,12 +1852,14 @@ def _run_transcribe_url(job_id: str, req: TranscribeUrlRequest, loop: asyncio.Ab
                     speaker_map = diarization.cluster_speakers(
                         embeddings, req.num_speakers, req.auto_detect_speakers, log
                     )
+                    del embeddings
                     n_spk = len(set(speaker_map.values())) if speaker_map else 0
                     log(f"✅ {n_spk} speaker(s) identified")
                 else:
                     log("⚠️ Diarization failed — saving without speaker identification")
             else:
                 log("⚠️ resemblyzer/scikit-learn not installed")
+            gc.collect()
 
         # Save
         base = os.path.splitext(audio_path)[0]
@@ -1847,13 +1888,14 @@ def _run_transcribe_url(job_id: str, req: TranscribeUrlRequest, loop: asyncio.Ab
 
         progress(100)
         log(f"\n🎉 Transcription complete: {len(saved)} file(s) generated")
+        log(f"[mem] RSS at end: {_rss_mb()}")
 
-        _jobs[job_id]["status"] = "done"
-        _jobs[job_id]["result"] = {
+        result_data = {
             "job_id": job_id,
             "history_ids": history_ids,
             "files": saved,
         }
+        _job_finish(job_id, status="done", result=result_data)
         _job_send(job_id, loop, {
             "type": "done",
             "history_ids": history_ids,
@@ -1862,8 +1904,7 @@ def _run_transcribe_url(job_id: str, req: TranscribeUrlRequest, loop: asyncio.Ab
 
     except Exception as e:
         log(f"❌ Error: {str(e)}")
-        _jobs[job_id]["status"] = "error"
-        _jobs[job_id]["error"] = str(e)
+        _job_finish(job_id, status="error", error=str(e))
         _job_send(job_id, loop, {"type": "error", "message": str(e)})
     finally:
         # Cleanup temp files
@@ -3051,14 +3092,14 @@ def _run_project_process(
         videos = proj_module.list_project_videos(project_id)
         if not videos:
             log("Nenhum video no projeto.")
-            _jobs[job_id]["status"] = "done"
+            _job_finish(job_id, status="done")
             _job_send(job_id, loop, {"type": "done"})
             return
 
         pending = [v for v in videos if v.get("status") != "transcribed"]
         if not pending:
             log("Todos os videos ja estao transcritos.")
-            _jobs[job_id]["status"] = "done"
+            _job_finish(job_id, status="done")
             _job_send(job_id, loop, {"type": "done"})
             return
         skipped = len(videos) - len(pending)
@@ -3221,7 +3262,7 @@ def _run_project_process(
 
         progress(100)
         log("\nProcessamento concluido!")
-        _jobs[job_id]["status"] = "done"
+        _job_finish(job_id, status="done")
         _job_send(job_id, loop, {"type": "done"})
 
     except Exception as e:
@@ -3229,8 +3270,7 @@ def _run_project_process(
         msg = f"Erro: {e}\n{traceback.format_exc()}"
         log(msg)
         logger.error("Erro no processamento do projeto %s: %s", project_id, e, exc_info=True)
-        _jobs[job_id]["status"] = "error"
-        _jobs[job_id]["error"] = str(e)
+        _job_finish(job_id, status="error", error=str(e))
         proj_module.update_project(project_id, status="error")
         _job_send(job_id, loop, {"type": "error", "message": str(e)})
 
@@ -3301,15 +3341,13 @@ def _run_download_source(
             proj_module.update_video(video_id, thumbnail_path=thumb_path)
             log("Thumbnail extracted.")
 
-        _jobs[job_id]["status"] = "done"
-        _jobs[job_id]["progress"] = 100
-        _jobs[job_id]["result"] = {"local_path": local_path, "video_id": video_id}
-        _job_send(job_id, loop, {"type": "done", "result": _jobs[job_id]["result"]})
+        result_data = {"local_path": local_path, "video_id": video_id}
+        _job_finish(job_id, status="done", result=result_data)
+        _job_send(job_id, loop, {"type": "done", "result": result_data})
 
     except Exception as e:
         log(f"Error: {e}")
-        _jobs[job_id]["status"] = "error"
-        _jobs[job_id]["error"] = str(e)
+        _job_finish(job_id, status="error", error=str(e))
         _job_send(job_id, loop, {"type": "error", "message": str(e)})
 
 
@@ -3562,8 +3600,7 @@ def _run_project_compile(
         proj_module.update_project(project_id, status="done", output_path=output_path)
         progress(100)
         log(f"\nVideo compilado: {os.path.basename(output_path)}")
-        _jobs[job_id]["status"] = "done"
-        _jobs[job_id]["result"] = output_path
+        _job_finish(job_id, status="done", result=output_path)
         _job_send(job_id, loop, {
             "type": "done",
             "output_path": output_path,
@@ -3575,8 +3612,7 @@ def _run_project_compile(
         msg = f"Erro: {e}\n{traceback.format_exc()}"
         log(msg)
         logger.error("Erro na compilacao do projeto %s: %s", project_id, e, exc_info=True)
-        _jobs[job_id]["status"] = "error"
-        _jobs[job_id]["error"] = str(e)
+        _job_finish(job_id, status="error", error=str(e))
         proj_module.update_project(project_id, status="error")
         _job_send(job_id, loop, {"type": "error", "message": str(e)})
     finally:
@@ -3654,14 +3690,12 @@ def _run_project_publish_youtube(
 
         progress(100)
         log(f"Upload concluido: {result['url']}")
-        _jobs[job_id]["status"] = "done"
-        _jobs[job_id]["result"] = result
+        _job_finish(job_id, status="done", result=result)
         _job_send(job_id, loop, {"type": "done", "youtube": result})
     except Exception as e:
         log(f"Erro no upload para YouTube: {e}")
         logger.error("Erro no upload do projeto %s para YouTube: %s", project_id, e, exc_info=True)
-        _jobs[job_id]["status"] = "error"
-        _jobs[job_id]["error"] = str(e)
+        _job_finish(job_id, status="error", error=str(e))
         _job_send(job_id, loop, {"type": "error", "message": str(e)})
 
 

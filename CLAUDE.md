@@ -126,7 +126,7 @@ Frontend padrao: `http://localhost:3000`
 - A API usa `PIXEL_API_KEY` para proteger endpoints de transcricao/processamento; frontend e backend devem usar a mesma chave.
 - Em transcricoes longas, o backend divide audio em chunks automaticamente para reduzir pico de memoria.
 - Ajustes de chunking por ambiente:
-  - `PIXEL_TRANSCRIBE_CHUNK_SECONDS` (padrao `300`)
+  - `PIXEL_TRANSCRIBE_CHUNK_SECONDS` (padrao `120`)
   - `PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS` (padrao `1.0`)
 - Arquivos temporarios de audio/chunks sao removidos apos o processamento; o resultado textual permanece salvo.
 - Jobs em memoria podem ser perdidos apos restart do backend; nesse caso o frontend pode receber `404` ao consultar `/api/jobs/{id}` antigo.
