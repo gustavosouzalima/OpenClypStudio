@@ -168,6 +168,65 @@ def _is_path_within_dir(path: Path, parent_dir: Path) -> bool:
         return False
 
 
+def _env_int(name: str, default: int, *, min_value: int = 0) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = default
+    return max(min_value, value)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+DEFAULT_TRANSCRIBE_MODEL = os.getenv("PIXEL_DEFAULT_WHISPER_MODEL", "medium").strip() or "medium"
+DEFAULT_TRANSCRIBE_BATCH_SIZE = _env_int("PIXEL_DEFAULT_BATCH_SIZE", 8, min_value=1)
+TRANSCRIBE_MAX_BATCH_SIZE_CPU = _env_int("PIXEL_MAX_BATCH_SIZE_CPU", 8, min_value=1)
+TRANSCRIBE_MAX_BATCH_SIZE_GPU = _env_int("PIXEL_MAX_BATCH_SIZE_GPU", 32, min_value=1)
+TRANSCRIBE_FORCE_CPU_SAFE_MODEL = _env_bool("PIXEL_FORCE_CPU_SAFE_MODEL", True)
+TRANSCRIBE_CPU_SAFE_MODEL = os.getenv("PIXEL_CPU_SAFE_MODEL", "medium").strip() or "medium"
+CPU_HEAVY_WHISPER_MODELS = {"large", "large-v1", "large-v2", "large-v3", "large-v3-turbo"}
+
+
+def _resolve_transcribe_runtime(
+    model: str,
+    batch_size: int,
+    log_fn=None,
+) -> tuple[str, int]:
+    requested_model = (model or "").strip() or DEFAULT_TRANSCRIBE_MODEL
+    requested_batch = max(1, int(batch_size))
+
+    cuda_available = bool(getattr(tr_module, "CUDA_AVAILABLE", False))
+    max_batch = TRANSCRIBE_MAX_BATCH_SIZE_GPU if cuda_available else TRANSCRIBE_MAX_BATCH_SIZE_CPU
+    resolved_batch = min(requested_batch, max_batch)
+    resolved_model = requested_model
+
+    if (
+        not cuda_available
+        and TRANSCRIBE_FORCE_CPU_SAFE_MODEL
+        and requested_model in CPU_HEAVY_WHISPER_MODELS
+    ):
+        resolved_model = TRANSCRIBE_CPU_SAFE_MODEL
+        if log_fn:
+            log_fn(
+                f"⚙️ CPU mode: model '{requested_model}' adjusted to "
+                f"'{resolved_model}' (configure PIXEL_CPU_SAFE_MODEL / PIXEL_FORCE_CPU_SAFE_MODEL)."
+            )
+
+    if resolved_batch != requested_batch and log_fn:
+        log_fn(
+            f"⚙️ Batch size adjusted from {requested_batch} to {resolved_batch} "
+            f"for current runtime (max={max_batch})."
+        )
+
+    return resolved_model, resolved_batch
+
+
 def _build_wav_chunks(
     audio_path: str,
     duration: float,
@@ -1121,10 +1180,10 @@ class EditorTranscriptionResult(BaseModel):
 @app.post("/api/editor/transcribe", status_code=201)
 async def transcribe_editor_audio(
     audio_file: UploadFile,
-    model: str = Form(default="large-v3-turbo"),
+    model: str = Form(default=DEFAULT_TRANSCRIBE_MODEL),
     language: str = Form(default="auto"),
     beam_size: int = Form(default=5),
-    batch_size: int = Form(default=32),
+    batch_size: int = Form(default=DEFAULT_TRANSCRIBE_BATCH_SIZE),
     _: None = Depends(_require_api_key),
 ):
     """
@@ -1136,10 +1195,10 @@ async def transcribe_editor_audio(
 
     Request:
     - audio_file: WAV file (multipart/form-data)
-    - model: Whisper model size (default: large-v3-turbo)
+    - model: Whisper model size (default: PIXEL_DEFAULT_WHISPER_MODEL or "medium")
     - language: Language code or "auto" (default: auto)
     - beam_size: Beam size for decoding (default: 5)
-    - batch_size: Batch size for batched inference (default: 32)
+    - batch_size: Batch size for batched inference (default: PIXEL_DEFAULT_BATCH_SIZE or 8)
 
     Response:
     - text: Full transcription text
@@ -1184,12 +1243,14 @@ async def transcribe_editor_audio(
         # Prepare language parameter
         lang_param = None if language == "auto" else language
 
+        model_name, effective_batch_size = _resolve_transcribe_runtime(model, batch_size)
+
         # Load Whisper model
-        _, batched = tr_module.get_whisper_model(model, None)
+        _, batched = tr_module.get_whisper_model(model_name, None)
         if not batched:
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to load Whisper model: {model}"
+                detail=f"Failed to load Whisper model: {model_name}"
             )
 
         # Transcribe (with chunking for long media)
@@ -1199,7 +1260,7 @@ async def transcribe_editor_audio(
             duration=duration,
             language=lang_param,
             beam_size=beam_size,
-            batch_size=batch_size,
+            batch_size=effective_batch_size,
             is_cancelled=lambda: False,
             log_fn=None,
         )
@@ -1254,10 +1315,10 @@ async def transcribe_editor_audio(
 class TranscribeUrlRequest(BaseModel):
     url: str
     audio_only: bool = True
-    model: str = "large-v3-turbo"
+    model: str = DEFAULT_TRANSCRIBE_MODEL
     language: str = "pt"
     beam_size: int = 5
-    batch_size: int = 32
+    batch_size: int = DEFAULT_TRANSCRIBE_BATCH_SIZE
     diarize: bool = False
     num_speakers: int = 2
     auto_detect_speakers: bool = False
@@ -1267,10 +1328,10 @@ class TranscribeUrlRequest(BaseModel):
 
 class TranscribeRequest(BaseModel):
     files: list[str] = Field(default_factory=list)
-    model: str = "large-v3-turbo"
+    model: str = DEFAULT_TRANSCRIBE_MODEL
     language: str = "pt"
     beam_size: int = 5
-    batch_size: int = 32
+    batch_size: int = DEFAULT_TRANSCRIBE_BATCH_SIZE
     diarize: bool = False
     num_speakers: int = 2
     auto_detect_speakers: bool = False
@@ -1291,9 +1352,10 @@ class AddVideoRequest(BaseModel):
 
 
 class ProcessProjectRequest(BaseModel):
-    model: str = "large-v3-turbo"
+    model: str = DEFAULT_TRANSCRIBE_MODEL
     language: str = "auto"
     beam_size: int = 5
+    batch_size: int = DEFAULT_TRANSCRIBE_BATCH_SIZE
     diarize: bool = False
 
 
@@ -1514,7 +1576,7 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
 
     try:
         total_files = max(len(req.files), 1)
-        model_name = req.model
+        model_name, effective_batch_size = _resolve_transcribe_runtime(req.model, req.batch_size, log)
         language = None if req.language == "auto" else req.language
 
         _, batched = tr_module.get_whisper_model(model_name, log)
@@ -1556,7 +1618,7 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
                 duration=duration,
                 language=language,
                 beam_size=req.beam_size,
-                batch_size=req.batch_size,
+                batch_size=effective_batch_size,
                 is_cancelled=lambda: bool(_jobs[job_id].get("cancelled")),
                 progress_fn=progress,
                 progress_start=file_progress_start + 5,
@@ -1714,11 +1776,12 @@ def _run_transcribe_url(job_id: str, req: TranscribeUrlRequest, loop: asyncio.Ab
 
         duration = audio.get_wav_duration(audio_path)
         language = None if req.language == "auto" else req.language
+        model_name, effective_batch_size = _resolve_transcribe_runtime(req.model, req.batch_size, log)
 
-        log(f"🎤 Transcribing (model={req.model}, beam={req.beam_size})...")
+        log(f"🎤 Transcribing (model={model_name}, beam={req.beam_size})...")
         progress(30)
 
-        _, batched = tr_module.get_whisper_model(req.model, log)
+        _, batched = tr_module.get_whisper_model(model_name, log)
         if not batched:
             raise RuntimeError("Failed to load Whisper model.")
 
@@ -1728,7 +1791,7 @@ def _run_transcribe_url(job_id: str, req: TranscribeUrlRequest, loop: asyncio.Ab
             duration=duration,
             language=language,
             beam_size=req.beam_size,
-            batch_size=req.batch_size,
+            batch_size=effective_batch_size,
             is_cancelled=lambda: bool(_jobs[job_id].get("cancelled")),
             progress_fn=progress,
             progress_start=30,
@@ -3004,7 +3067,8 @@ def _run_project_process(
         videos = pending
 
         total = len(videos)
-        _, batched = tr_module.get_whisper_model(req.model, log)
+        model_name, effective_batch_size = _resolve_transcribe_runtime(req.model, req.batch_size, log)
+        _, batched = tr_module.get_whisper_model(model_name, log)
         if not batched:
             raise RuntimeError("Nao foi possivel carregar o modelo Whisper.")
 
@@ -3094,7 +3158,7 @@ def _run_project_process(
                     duration=duration_wav,
                     language=language,
                     beam_size=req.beam_size,
-                    batch_size=req.batch_size,
+                    batch_size=effective_batch_size,
                     is_cancelled=lambda: bool(_jobs[job_id].get("cancelled")),
                     log_fn=log,
                 )

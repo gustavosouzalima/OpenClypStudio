@@ -183,6 +183,13 @@ See `.env.openclyp.example` for all variables:
 | `TRAEFIK_ENTRYPOINT` | Traefik entrypoint (`websecure` usually) | Yes (Traefik mode) |
 | `TRAEFIK_CERTRESOLVER` | Traefik cert resolver name | Yes (Traefik mode) |
 | `TRAEFIK_DOCKER_NETWORK` | External Docker network shared with Traefik | Yes (Traefik mode) |
+| `PIXEL_DEFAULT_WHISPER_MODEL` | Default Whisper model for backend requests | Optional |
+| `PIXEL_DEFAULT_BATCH_SIZE` | Default batch size for backend transcription | Optional |
+| `PIXEL_MAX_BATCH_SIZE_CPU` | Maximum batch size when running on CPU | Optional |
+| `PIXEL_FORCE_CPU_SAFE_MODEL` | Auto-downgrade `large*` models on CPU (`true/false`) | Optional |
+| `PIXEL_CPU_SAFE_MODEL` | Safe model used when downgrade is enabled | Optional |
+| `PIXEL_TRANSCRIBE_CHUNK_SECONDS` | Chunk size for long audio transcription | Optional |
+| `PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS` | Overlap between chunks in seconds | Optional |
 | `GEMINI_API_KEY` | Optional — AI script generation | No |
 | `OPENAI_API_KEY` | Optional — AI script generation | No |
 
