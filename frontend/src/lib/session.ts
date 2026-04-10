@@ -26,6 +26,13 @@ function b64urlDecode(str: string): Uint8Array {
   return Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
 }
 
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  // Ensure an ArrayBuffer-backed view for subtle.verify typings across runtimes.
+  const copy = new Uint8Array(bytes.length);
+  copy.set(bytes);
+  return copy.buffer;
+}
+
 async function hmacKey(secret: string, usage: "sign" | "verify") {
   return crypto.subtle.importKey(
     "raw",
@@ -77,7 +84,7 @@ export async function verifySessionToken(token: string): Promise<boolean> {
     const valid = await crypto.subtle.verify(
       "HMAC",
       key,
-      b64urlDecode(signature),
+      toArrayBuffer(b64urlDecode(signature)),
       new TextEncoder().encode(payload),
     );
     if (!valid) return false;
