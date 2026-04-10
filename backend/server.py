@@ -370,7 +370,7 @@ _mp_batched = None
 
 
 def _mp_transcribe_one(args: tuple) -> tuple:
-    chunk_path, chunk_offset, chunk_index, language, beam_size, batch_size = args
+    chunk_path, chunk_offset, chunk_index, language, beam_size, batch_size, vad_filter = args
     if _mp_cancel_event and _mp_cancel_event.is_set():
         return (chunk_index, [], None, None)
     try:
@@ -379,8 +379,8 @@ def _mp_transcribe_one(args: tuple) -> tuple:
             language=language,
             beam_size=beam_size,
             batch_size=batch_size,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
+            vad_filter=vad_filter,
+            vad_parameters=dict(min_silence_duration_ms=500) if vad_filter else None,
             condition_on_previous_text=False,
         )
         detected = getattr(info, "language", None)
@@ -434,6 +434,7 @@ def _transcribe_single_chunk(
     language: str | None,
     beam_size: int,
     batch_size: int,
+    vad_filter: bool = True,
 ) -> tuple[list, str | None]:
     """Transcribe one audio chunk. Safe to call from a ThreadPoolExecutor."""
     segments_gen, info = batched.transcribe(
@@ -441,8 +442,8 @@ def _transcribe_single_chunk(
         language=language,
         beam_size=beam_size,
         batch_size=batch_size,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
+        vad_filter=vad_filter,
+        vad_parameters=dict(min_silence_duration_ms=500) if vad_filter else None,
         condition_on_previous_text=False,
     )
     detected = getattr(info, "language", None)
@@ -467,6 +468,7 @@ def _transcribe_with_optional_chunking(
     language: str | None,
     beam_size: int,
     batch_size: int,
+    vad_filter: bool = True,
     is_cancelled,
     progress_fn=None,
     progress_start: int = 0,
@@ -500,7 +502,7 @@ def _transcribe_with_optional_chunking(
             log_fn(f"   Transcribing (beam={beam_size}, batch={batch_size})...")
         segs, detected = _transcribe_single_chunk(
             batched, chunks[0][0], chunks[0][1], 0,
-            language, beam_size, batch_size,
+            language, beam_size, batch_size, vad_filter,
         )
         if progress_fn:
             progress_fn(progress_start + progress_span)
@@ -524,7 +526,7 @@ def _transcribe_with_optional_chunking(
         try:
             pool = _get_mp_pool(model_name, max_workers)
             args_list = [
-                (cp, co, ci, language, beam_size, batch_size)
+                (cp, co, ci, language, beam_size, batch_size, vad_filter)
                 for ci, (cp, co) in enumerate(chunks)
             ]
             for chunk_idx, segs, detected, error in pool.imap_unordered(
@@ -568,7 +570,7 @@ def _transcribe_with_optional_chunking(
                 future = pool.submit(
                     _transcribe_single_chunk,
                     batched, chunk_path, chunk_offset, chunk_index,
-                    language, beam_size, batch_size,
+                    language, beam_size, batch_size, vad_filter,
                 )
                 futures[future] = chunk_index
 
@@ -1556,6 +1558,7 @@ async def transcribe_editor_audio(
             language=lang_param,
             beam_size=beam_size,
             batch_size=effective_batch_size,
+            vad_filter=True,
             is_cancelled=lambda: False,
             log_fn=None,
         )
@@ -1614,6 +1617,7 @@ class TranscribeUrlRequest(BaseModel):
     language: str = "pt"
     beam_size: int = DEFAULT_BEAM_SIZE
     batch_size: int = DEFAULT_TRANSCRIBE_BATCH_SIZE
+    vad_filter: bool = False
     diarize: bool = False
     num_speakers: int = 2
     auto_detect_speakers: bool = False
@@ -1627,6 +1631,7 @@ class TranscribeRequest(BaseModel):
     language: str = "pt"
     beam_size: int = DEFAULT_BEAM_SIZE
     batch_size: int = DEFAULT_TRANSCRIBE_BATCH_SIZE
+    vad_filter: bool = False
     diarize: bool = False
     num_speakers: int = 2
     auto_detect_speakers: bool = False
@@ -1651,6 +1656,7 @@ class ProcessProjectRequest(BaseModel):
     language: str = "auto"
     beam_size: int = DEFAULT_BEAM_SIZE
     batch_size: int = DEFAULT_TRANSCRIBE_BATCH_SIZE
+    vad_filter: bool = False
     diarize: bool = False
 
 
@@ -1916,6 +1922,7 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
                 language=language,
                 beam_size=req.beam_size,
                 batch_size=effective_batch_size,
+                vad_filter=req.vad_filter,
                 is_cancelled=lambda: bool(_jobs[job_id].get("cancelled")),
                 progress_fn=progress,
                 progress_start=file_progress_start + 5,
@@ -2096,6 +2103,7 @@ def _run_transcribe_url(job_id: str, req: TranscribeUrlRequest, loop: asyncio.Ab
             language=language,
             beam_size=req.beam_size,
             batch_size=effective_batch_size,
+            vad_filter=req.vad_filter,
             is_cancelled=lambda: bool(_jobs[job_id].get("cancelled")),
             progress_fn=progress,
             progress_start=30,
@@ -3469,6 +3477,7 @@ def _run_project_process(
                     language=language,
                     beam_size=req.beam_size,
                     batch_size=effective_batch_size,
+                    vad_filter=req.vad_filter,
                     is_cancelled=lambda: bool(_jobs[job_id].get("cancelled")),
                     log_fn=log,
                 )
