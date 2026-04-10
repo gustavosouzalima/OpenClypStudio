@@ -119,7 +119,7 @@ export function PixelTranscriptionsShell() {
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [config, setConfig] = useState<PixelTranscriptionRequest>({
     model: "small",
-    language: "auto",
+    language: "pt",
     beam_size: 1,
     batch_size: 16,
     diarize: false,
