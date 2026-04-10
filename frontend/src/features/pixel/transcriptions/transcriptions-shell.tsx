@@ -97,6 +97,34 @@ function isLikelySilentChunk(audio: Float32Array): boolean {
   return estimateChunkRms(audio) < LOCAL_SILENCE_RMS_THRESHOLD;
 }
 
+function tokenizeTranscriptionText(text: string): string[] {
+  const normalized = text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, " ");
+  return normalized.match(/[a-z0-9]+/g) ?? [];
+}
+
+function isLowInformationTranscriptionText(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+
+  const tokens = tokenizeTranscriptionText(trimmed);
+  if (tokens.length === 0) return true;
+
+  const singleCharTokens = tokens.filter((token) => token.length === 1).length;
+  const longTokens = tokens.filter((token) => token.length >= 3).length;
+  const uniqueTokens = new Set(tokens).size;
+  const singleCharRatio = singleCharTokens / tokens.length;
+  const uniqueRatio = uniqueTokens / tokens.length;
+
+  if (tokens.length < 3) return true;
+  if (longTokens === 0) return true;
+  if (tokens.length >= 6 && uniqueRatio <= 0.35) return true;
+  if (tokens.length >= 4 && singleCharRatio >= 0.75) return true;
+  return false;
+}
+
 const ENGINE_OPTIONS: Array<{
   value: TranscriptionEnginePreference;
   label: string;
@@ -660,6 +688,8 @@ export function PixelTranscriptionsShell() {
     const chunkProgress = new Map<number, number>();
     const chunkResults = new Map<number, { text: string; segments: Array<{ text: string; start: number; end: number }> }>();
     let meaningfulChunkCount = 0;
+    let emittedTextChunkCount = 0;
+    let lowInformationChunkCount = 0;
     let accumulatedTextChars = 0;
 
     const updateOverallProgress = () => {
@@ -723,10 +753,16 @@ export function PixelTranscriptionsShell() {
 
       chunkResults.set(chunk.index, { text: result.text, segments: shiftedSegments });
       chunkProgress.set(chunk.index, 100);
-      const chunkTextPreview = result.text.trim().slice(0, 80);
-      if (result.text.trim().length > 0) {
-        meaningfulChunkCount += 1;
-        accumulatedTextChars += result.text.trim().length;
+      const chunkText = result.text.trim();
+      const chunkTextPreview = chunkText.slice(0, 80);
+      if (chunkText.length > 0) {
+        emittedTextChunkCount += 1;
+        accumulatedTextChars += chunkText.length;
+        if (isLowInformationTranscriptionText(chunkText)) {
+          lowInformationChunkCount += 1;
+        } else {
+          meaningfulChunkCount += 1;
+        }
       }
       appendLocalLog(
         `[${fileName}] chunk ${chunk.index + 1}/${chunks.length} done (${shiftedSegments.length} segs${chunkTextPreview ? `, text="${chunkTextPreview}..."` : ", EMPTY"})`,
@@ -751,10 +787,21 @@ export function PixelTranscriptionsShell() {
     }
 
     const text = mergedSegments.map((segment) => segment.text.trim()).filter(Boolean).join(" ");
+    const minimumInformativeChunks = Math.max(2, Math.ceil(emittedTextChunkCount * 0.35));
+    const tooManyLowInformationChunks =
+      emittedTextChunkCount >= 4 &&
+      lowInformationChunkCount / Math.max(1, emittedTextChunkCount) >= 0.7;
     const lowSignalGpuOutput =
       chunks.length >= 4 &&
-      (meaningfulChunkCount <= Math.floor(chunks.length * 0.2) || accumulatedTextChars < 24);
+      (
+        accumulatedTextChars < 24 ||
+        (emittedTextChunkCount >= 4 && meaningfulChunkCount < minimumInformativeChunks) ||
+        tooManyLowInformationChunks
+      );
     if (lowSignalGpuOutput) {
+      appendLocalLog(
+        `[${fileName}] GPU low-information output detected (${meaningfulChunkCount}/${emittedTextChunkCount} informative chunks).`,
+      );
       throw new Error("GPU_LOW_SIGNAL_OUTPUT");
     }
     if (!text.trim()) {
