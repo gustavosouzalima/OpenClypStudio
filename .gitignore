@@ -45,6 +45,7 @@ node_modules/
 .bun-install/
 .bun-tmp/
 frontend/.content-collections/
+frontend/next-env.d.ts
 
 # ── OpenCut legacy (still present in repo) ─────────────
 OpenCut/.bun-install/
