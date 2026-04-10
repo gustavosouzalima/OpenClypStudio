@@ -2,8 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps for faster-whisper + FFmpeg
+# System deps for faster-whisper + FFmpeg + native Python wheels (e.g. webrtcvad)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
