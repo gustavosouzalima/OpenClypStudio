@@ -43,11 +43,23 @@ services:
       # ── Auth simples ──────────────────────────────────────────────────
       SESSION_SECRET: "${SESSION_SECRET}"        # obrigatório
       ADMIN_PASSWORD: "${ADMIN_PASSWORD}"        # obrigatório
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET}" # recomendado
     expose:
       - "4711"
     depends_on:
       backend:
         condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.openclyp.rule=Host(`${TRAEFIK_HOST:-openclyp.smartiabr.com}`)"
+      - "traefik.http.routers.openclyp.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.openclyp.tls=true"
+      - "traefik.http.routers.openclyp.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.services.openclyp.loadbalancer.server.port=4711"
+      - "traefik.docker.network=${TRAEFIK_DOCKER_NETWORK:-traefik-public}"
+    networks:
+      - default
+      - traefik-public
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:4711/health > /dev/null || exit 1"]
       interval: 30s
@@ -55,27 +67,10 @@ services:
       retries: 3
       start_period: 30s
 
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-    command: caddy reverse-proxy --from openclyp.smartiabr.com --to frontend:4711
-    volumes:
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      frontend:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:80 > /dev/null 2>&1 || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
 volumes:
   openclyp_data:
-  caddy_data:
-  caddy_config:
+
+networks:
+  traefik-public:
+    external: true
+    name: "${TRAEFIK_DOCKER_NETWORK:-traefik-public}"
