@@ -54,7 +54,7 @@ _batched_cache: dict = {}
 # 1 thread per CTranslate2 call — parallelism comes from multiple workers.
 _CPU_THREADS = int(os.getenv("PIXEL_CPU_THREADS", "1"))
 # CTranslate2 internal worker pool size — must be >= parallel chunk workers.
-_NUM_WORKERS = int(os.getenv("PIXEL_NUM_WORKERS", "0")) or max(1, os.cpu_count() or 2)
+_NUM_WORKERS = int(os.getenv("PIXEL_NUM_WORKERS", "0")) or 1
 
 
 def get_whisper_model(model_size: str, log_fn=None):

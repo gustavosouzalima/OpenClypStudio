@@ -8,11 +8,13 @@ import io
 import json
 import logging
 import mimetypes
+import multiprocessing
 import os
 import shutil
 import sqlite3
 import hmac
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -174,7 +176,7 @@ COMPILADOS_DIR = DATA_DIR / "compilados"
 COMPILADOS_DIR.mkdir(parents=True, exist_ok=True)
 
 TRANSCRIBE_CHUNK_SECONDS = max(0, int(os.getenv("PIXEL_TRANSCRIBE_CHUNK_SECONDS", "30")))
-TRANSCRIBE_CHUNK_OVERLAP_SECONDS = max(0.0, float(os.getenv("PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS", "1.0")))
+TRANSCRIBE_CHUNK_OVERLAP_SECONDS = max(0.0, float(os.getenv("PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS", "0.5")))
 
 logger.info(
     "Transcription config: chunk=%ds, overlap=%.1fs",
@@ -207,9 +209,9 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-DEFAULT_TRANSCRIBE_MODEL = os.getenv("PIXEL_DEFAULT_WHISPER_MODEL", "medium").strip() or "medium"
-DEFAULT_TRANSCRIBE_BATCH_SIZE = _env_int("PIXEL_DEFAULT_BATCH_SIZE", 4, min_value=1)
-TRANSCRIBE_MAX_BATCH_SIZE_CPU = _env_int("PIXEL_MAX_BATCH_SIZE_CPU", 4, min_value=1)
+DEFAULT_TRANSCRIBE_MODEL = os.getenv("PIXEL_DEFAULT_WHISPER_MODEL", "small").strip() or "small"
+DEFAULT_TRANSCRIBE_BATCH_SIZE = _env_int("PIXEL_DEFAULT_BATCH_SIZE", 8, min_value=1)
+TRANSCRIBE_MAX_BATCH_SIZE_CPU = _env_int("PIXEL_MAX_BATCH_SIZE_CPU", 8, min_value=1)
 TRANSCRIBE_MAX_BATCH_SIZE_GPU = _env_int("PIXEL_MAX_BATCH_SIZE_GPU", 32, min_value=1)
 TRANSCRIBE_FORCE_CPU_SAFE_MODEL = _env_bool("PIXEL_FORCE_CPU_SAFE_MODEL", True)
 TRANSCRIBE_CPU_SAFE_MODEL = os.getenv("PIXEL_CPU_SAFE_MODEL", "medium").strip() or "medium"
@@ -273,50 +275,155 @@ def _build_wav_chunks(
 
     chunks: list[tuple[str, float]] = []
     temp_files: list[str] = []
-    start = 0.0
     index = 0
 
-    while start < duration:
-        chunk_duration = min(float(chunk_seconds) + overlap_seconds, duration - start)
-        chunk_path = chunk_dir / f"{Path(audio_path).stem}_chunk_{uuid.uuid4().hex}_{index:04d}.wav"
-        cmd = [
-            "ffmpeg",
-            "-threads",
-            "0",
-            "-ss",
-            f"{start:.3f}",
-            "-t",
-            f"{chunk_duration:.3f}",
-            "-i",
-            audio_path,
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-            "-y",
-            str(chunk_path),
-        ]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=3600)
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("FFmpeg timed out while splitting audio into chunks.") from exc
-        except FileNotFoundError as exc:
-            raise RuntimeError("FFmpeg not found while splitting audio into chunks.") from exc
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or b"").decode(errors="ignore")[:240]
-            raise RuntimeError(f"Failed to split audio chunk: {stderr}") from exc
+    import wave as _wave
 
-        chunks.append((str(chunk_path), start))
-        temp_files.append(str(chunk_path))
-        start += float(chunk_seconds)
-        index += 1
+    try:
+        with _wave.open(audio_path, "rb") as wf:
+            sample_rate = wf.getframerate()
+            n_channels = wf.getnchannels()
+            sample_width = wf.getsampwidth()
+            total_frames = wf.getnframes()
+            chunk_frames = int(chunk_seconds * sample_rate)
+            overlap_frames = int(overlap_seconds * sample_rate)
+            start_frame = 0
+
+            while start_frame < total_frames:
+                n_frames = min(chunk_frames + overlap_frames, total_frames - start_frame)
+                chunk_path = chunk_dir / f"{Path(audio_path).stem}_chunk_{uuid.uuid4().hex}_{index:04d}.wav"
+                wf.setpos(start_frame)
+                frames_data = wf.readframes(n_frames)
+                with _wave.open(str(chunk_path), "wb") as out_wf:
+                    out_wf.setnchannels(n_channels)
+                    out_wf.setsampwidth(sample_width)
+                    out_wf.setframerate(sample_rate)
+                    out_wf.writeframes(frames_data)
+                start_offset = start_frame / sample_rate
+                chunks.append((str(chunk_path), start_offset))
+                temp_files.append(str(chunk_path))
+                start_frame += chunk_frames
+                index += 1
+    except Exception:
+        chunks.clear()
+        temp_files.clear()
+        start = 0.0
+        index = 0
+        while start < duration:
+            chunk_duration = min(float(chunk_seconds) + overlap_seconds, duration - start)
+            chunk_path = chunk_dir / f"{Path(audio_path).stem}_chunk_{uuid.uuid4().hex}_{index:04d}.wav"
+            cmd = [
+                "ffmpeg", "-threads", "0",
+                "-ss", f"{start:.3f}", "-t", f"{chunk_duration:.3f}",
+                "-i", audio_path,
+                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+                "-y", str(chunk_path),
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, timeout=3600)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("FFmpeg timed out while splitting audio into chunks.") from exc
+            except FileNotFoundError as exc:
+                raise RuntimeError("FFmpeg not found while splitting audio into chunks.") from exc
+            except subprocess.CalledProcessError as exc:
+                stderr = (exc.stderr or b"").decode(errors="ignore")[:240]
+                raise RuntimeError(f"Failed to split audio chunk: {stderr}") from exc
+            chunks.append((str(chunk_path), start))
+            temp_files.append(str(chunk_path))
+            start += float(chunk_seconds)
+            index += 1
 
     if log_fn and len(chunks) > 1:
-        log_fn(f"🔪 Chunking enabled: {len(chunks)} chunk(s) of ~{chunk_seconds}s")
+        log_fn(f"🔪 Chunking enabled: {len(chunks)} chunk(s) of ~{chunk_seconds}s (in-memory)")
 
     return chunks, temp_files
+
+
+# ── Multiprocessing transcription (bypasses GIL on Linux) ────────────────────
+_mp_pool = None
+_mp_pool_model = None
+_mp_cancel_event: multiprocessing.Event | None = None
+
+_USE_MULTIPROCESSING = (
+    sys.platform != "win32"
+    and not _env_bool("PIXEL_NO_MULTIPROCESSING", False)
+)
+
+try:
+    _mp_ctx = multiprocessing.get_context("fork") if sys.platform != "win32" else None
+except ValueError:
+    _mp_ctx = None
+    _USE_MULTIPROCESSING = False
+
+
+def _mp_init_worker(model_name: str):
+    global _mp_batched
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    import transcription as _tr
+    _tr._model_cache.pop(model_name, None)
+    _tr._batched_cache.pop(model_name, None)
+    _, _mp_batched = _tr.get_whisper_model(model_name)
+
+
+_mp_batched = None
+
+
+def _mp_transcribe_one(args: tuple) -> tuple:
+    chunk_path, chunk_offset, chunk_index, language, beam_size, batch_size = args
+    if _mp_cancel_event and _mp_cancel_event.is_set():
+        return (chunk_index, [], None, None)
+    try:
+        segments_gen, info = _mp_batched.transcribe(
+            chunk_path,
+            language=language,
+            beam_size=beam_size,
+            batch_size=batch_size,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+            condition_on_previous_text=False,
+        )
+        detected = getattr(info, "language", None)
+        segments = []
+        for seg in segments_gen:
+            segments.append(
+                SimpleNamespace(
+                    text=seg.text,
+                    start=chunk_offset + float(seg.start),
+                    end=chunk_offset + float(seg.end),
+                )
+            )
+        return (chunk_index, segments, detected, None)
+    except Exception as exc:
+        return (chunk_index, [], None, str(exc))
+
+
+def _get_mp_pool(model_name: str, max_workers: int):
+    global _mp_pool, _mp_pool_model, _mp_cancel_event
+    if _mp_pool is not None and _mp_pool_model == model_name:
+        _mp_cancel_event.clear()
+        return _mp_pool
+    _shutdown_mp_pool()
+    _mp_pool_model = model_name
+    _mp_cancel_event = _mp_ctx.Event()
+    _mp_pool = _mp_ctx.Pool(
+        processes=max_workers,
+        initializer=_mp_init_worker,
+        initargs=(model_name,),
+    )
+    return _mp_pool
+
+
+def _shutdown_mp_pool():
+    global _mp_pool, _mp_pool_model
+    if _mp_pool is not None:
+        try:
+            _mp_pool.terminate()
+            _mp_pool.join()
+        except Exception:
+            pass
+        _mp_pool = None
+        _mp_pool_model = None
 
 
 def _transcribe_single_chunk(
@@ -354,6 +461,7 @@ def _transcribe_single_chunk(
 def _transcribe_with_optional_chunking(
     *,
     batched,
+    model_name: str = "",
     audio_path: str,
     duration: float,
     language: str | None,
@@ -366,7 +474,6 @@ def _transcribe_with_optional_chunking(
     log_fn=None,
 ) -> tuple[list, str | None, list[str]]:
     import resource_tuner
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     if duration <= 0:
         duration = 1.0
@@ -386,7 +493,7 @@ def _transcribe_with_optional_chunking(
     else:
         chunks = [(audio_path, 0.0)]
 
-    # ── Single chunk: fast path (no thread pool overhead) ──
+    # ── Single chunk: fast path (no pool overhead) ──
     if len(chunks) == 1:
         if log_fn:
             log_fn(f"[mem] RSS before transcribe: {_rss_mb()}")
@@ -404,59 +511,96 @@ def _transcribe_with_optional_chunking(
     if log_fn:
         log_fn(
             f"[adaptive] {len(chunks)} chunks, processing {max_workers} in parallel "
-            f"(beam={beam_size}, batch={batch_size})"
+            f"(beam={beam_size}, batch={batch_size}, mp={_USE_MULTIPROCESSING})"
         )
         log_fn(f"[mem] RSS before parallel transcribe: {_rss_mb()}")
 
-    # Results keyed by chunk_index for ordered merge
     chunk_results: dict[int, tuple[list, str | None]] = {}
     detected_language: str | None = None
     completed_count = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {}
-        for chunk_index, (chunk_path, chunk_offset) in enumerate(chunks):
-            if is_cancelled():
-                break
-            future = pool.submit(
-                _transcribe_single_chunk,
-                batched, chunk_path, chunk_offset, chunk_index,
-                language, beam_size, batch_size,
-            )
-            futures[future] = chunk_index
-
-        for future in as_completed(futures):
-            if is_cancelled():
-                # Cancel remaining futures
-                for f in futures:
-                    f.cancel()
-                break
-
-            chunk_idx = futures[future]
-            try:
-                segs, detected = future.result()
+    if _USE_MULTIPROCESSING and max_workers > 1 and model_name:
+        # ── Multiprocessing path: true parallelism, no GIL ──
+        try:
+            pool = _get_mp_pool(model_name, max_workers)
+            args_list = [
+                (cp, co, ci, language, beam_size, batch_size)
+                for ci, (cp, co) in enumerate(chunks)
+            ]
+            for chunk_idx, segs, detected, error in pool.imap_unordered(
+                _mp_transcribe_one, args_list
+            ):
+                if is_cancelled():
+                    if _mp_cancel_event:
+                        _mp_cancel_event.set()
+                    break
+                if error and log_fn:
+                    log_fn(f"   Chunk {chunk_idx + 1} failed: {error}")
                 chunk_results[chunk_idx] = (segs, detected)
-            except Exception as exc:
+                completed_count += 1
                 if log_fn:
-                    log_fn(f"   Chunk {chunk_idx + 1} failed: {exc}")
-                chunk_results[chunk_idx] = ([], None)
-
-            completed_count += 1
-            if log_fn:
-                log_fn(f"   Chunk {chunk_idx + 1}/{len(chunks)} done ({len(chunk_results.get(chunk_idx, ([],))[0])} segs)")
-
-            # Check memory pressure and log it
+                    log_fn(f"   Chunk {chunk_idx + 1}/{len(chunks)} done ({len(segs)} segs)")
+                if progress_fn:
+                    frac = completed_count / len(chunks)
+                    pct = min(
+                        progress_start + int(frac * max(progress_span, 1)),
+                        progress_start + progress_span,
+                    )
+                    progress_fn(pct)
             if resource_tuner.check_memory_pressure() and log_fn:
                 log_fn(f"[mem] WARNING: memory pressure detected (RSS={_rss_mb()})")
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"   Multiprocessing error, falling back to threads: {exc}")
+            _shutdown_mp_pool()
+            chunk_results.clear()
+            completed_count = 0
 
-            # Emit progress based on completed fraction
-            if progress_fn:
-                frac = completed_count / len(chunks)
-                pct = min(
-                    progress_start + int(frac * max(progress_span, 1)),
-                    progress_start + progress_span,
+    if not chunk_results:
+        # ── ThreadPoolExecutor fallback (Windows / mp disabled / mp error) ──
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {}
+            for chunk_index, (chunk_path, chunk_offset) in enumerate(chunks):
+                if is_cancelled():
+                    break
+                future = pool.submit(
+                    _transcribe_single_chunk,
+                    batched, chunk_path, chunk_offset, chunk_index,
+                    language, beam_size, batch_size,
                 )
-                progress_fn(pct)
+                futures[future] = chunk_index
+
+            for future in as_completed(futures):
+                if is_cancelled():
+                    for f in futures:
+                        f.cancel()
+                    break
+
+                chunk_idx = futures[future]
+                try:
+                    segs, detected = future.result()
+                    chunk_results[chunk_idx] = (segs, detected)
+                except Exception as exc:
+                    if log_fn:
+                        log_fn(f"   Chunk {chunk_idx + 1} failed: {exc}")
+                    chunk_results[chunk_idx] = ([], None)
+
+                completed_count += 1
+                if log_fn:
+                    log_fn(f"   Chunk {chunk_idx + 1}/{len(chunks)} done ({len(chunk_results.get(chunk_idx, ([],))[0])} segs)")
+
+                if resource_tuner.check_memory_pressure() and log_fn:
+                    log_fn(f"[mem] WARNING: memory pressure detected (RSS={_rss_mb()})")
+
+                if progress_fn:
+                    frac = completed_count / len(chunks)
+                    pct = min(
+                        progress_start + int(frac * max(progress_span, 1)),
+                        progress_start + progress_span,
+                    )
+                    progress_fn(pct)
 
     # ── Merge results in chunk order with overlap dedup ──
     segments_list: list = []
@@ -561,6 +705,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_PREWARM_MODEL = _env_bool("PIXEL_PREWARM_MODEL", True)
+
+
+@app.on_event("startup")
+async def _startup():
+    if _PREWARM_MODEL and FASTER_WHISPER_AVAILABLE():
+        model_name = DEFAULT_TRANSCRIBE_MODEL
+        logger.info("Pre-warming Whisper model '%s' in background...", model_name)
+
+        def _load():
+            try:
+                tr_module.get_whisper_model(model_name, lambda msg: logger.info("  pre-warm: %s", msg))
+                logger.info("Pre-warm complete: model '%s' ready", model_name)
+            except Exception:
+                logger.warning("Pre-warm failed — model will load on first transcription", exc_info=True)
+
+        threading.Thread(target=_load, daemon=True).start()
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    _shutdown_mp_pool()
+
+
 # ── Jobs ──────────────────────────────────────────────────────────────────────
 
 @app.get("/api/jobs/{job_id}")
@@ -1381,6 +1550,7 @@ async def transcribe_editor_audio(
         # Transcribe (with chunking for long media)
         segments_list_raw, detected_language, temp_chunk_files = _transcribe_with_optional_chunking(
             batched=batched,
+            model_name=model_name,
             audio_path=audio_path,
             duration=duration,
             language=lang_param,
@@ -1740,6 +1910,7 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
 
             segments_list, detected_language, chunk_temp_files = _transcribe_with_optional_chunking(
                 batched=batched,
+                model_name=model_name,
                 audio_path=audio_path,
                 duration=duration,
                 language=language,
@@ -1919,6 +2090,7 @@ def _run_transcribe_url(job_id: str, req: TranscribeUrlRequest, loop: asyncio.Ab
 
         segments_list, detected_language, chunk_temp_files = _transcribe_with_optional_chunking(
             batched=batched,
+            model_name=model_name,
             audio_path=audio_path,
             duration=duration,
             language=language,
@@ -3291,6 +3463,7 @@ def _run_project_process(
 
                 segments_list, detected_language, chunk_temp_files = _transcribe_with_optional_chunking(
                     batched=batched,
+                    model_name=model_name,
                     audio_path=audio_path,
                     duration=duration_wav,
                     language=language,

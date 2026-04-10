@@ -125,8 +125,13 @@ Frontend padrao: `http://localhost:3000`
 
 - A API usa `PIXEL_API_KEY` para proteger endpoints de transcricao/processamento; frontend e backend devem usar a mesma chave.
 - Em transcricoes longas, o backend divide audio em chunks automaticamente para reduzir pico de memoria.
+- Chunking usa split in-memory via modulo `wave` do Python (fallback para FFmpeg subprocess em caso de erro).
 - Ajustes de chunking por ambiente:
   - `PIXEL_TRANSCRIBE_CHUNK_SECONDS` (padrao `120`)
-  - `PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS` (padrao `1.0`)
+  - `PIXEL_TRANSCRIBE_CHUNK_OVERLAP_SECONDS` (padrao `0.5`)
+- Modelo Whisper default: `small` (`PIXEL_DEFAULT_WHISPER_MODEL`).
+- Batch size default: `8` para CPU (`PIXEL_DEFAULT_BATCH_SIZE`, `PIXEL_MAX_BATCH_SIZE_CPU`).
+- Pre-warm do modelo na inicializacao habilitado por padrao (`PIXEL_PREWARM_MODEL`).
+- Para usar modelo `medium` ou `large`, definir `PIXEL_DEFAULT_WHISPER_MODEL` no ambiente (mais lento, mais RAM).
 - Arquivos temporarios de audio/chunks sao removidos apos o processamento; o resultado textual permanece salvo.
 - Jobs em memoria podem ser perdidos apos restart do backend; nesse caso o frontend pode receber `404` ao consultar `/api/jobs/{id}` antigo.
