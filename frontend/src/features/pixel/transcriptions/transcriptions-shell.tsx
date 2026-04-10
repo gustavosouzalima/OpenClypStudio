@@ -536,46 +536,116 @@ export function PixelTranscriptionsShell() {
     language: TranscriptionLanguage;
     onProgress: (progress: number) => void;
   }): Promise<{ text: string; segments: number }> => {
-    let highestProgress = 0;
+    const durationSeconds = samples.length / sampleRate;
+    appendLocalLog(`[${fileName}] GPU transcription started (duration=${durationSeconds.toFixed(1)}s)`);
 
-    appendLocalLog(`[${fileName}] direct GPU transcription started`);
+    if (durationSeconds <= 30) {
+      let highestProgress = 0;
+      const result = await service.transcribe({
+        audioData: samples,
+        language,
+        modelId,
+        sampleRate,
+        devicePreference: "webgpu",
+        returnTimestamps: true,
+        onProgress: (progress) => {
+          const raw = Math.max(0, Math.min(100, progress.progress || 0));
+          const normalized =
+            progress.status === "loading-model"
+              ? Math.floor(raw * 0.15)
+              : 15 + Math.floor(raw * 0.85);
+          highestProgress = Math.max(highestProgress, normalized);
+          onProgress(highestProgress);
+        },
+        onLog: (message) => {
+          if (
+            message.startsWith("worker:init-start") ||
+            message.startsWith("worker:init-complete") ||
+            message.startsWith("worker:transcribe-start") ||
+            message.startsWith("worker:transcribe-complete") ||
+            message.startsWith("transcribe:error")
+          ) {
+            appendLocalLog(`[${fileName}] ${message}`);
+          }
+        },
+      });
+      onProgress(100);
+      return { text: result.text, segments: result.segments.length };
+    }
 
-    const result = await service.transcribe({
-      audioData: samples,
-      language,
-      modelId,
-      sampleRate,
-      devicePreference: "webgpu",
-      returnTimestamps: true,
-      onProgress: (progress) => {
-        const raw = Math.max(0, Math.min(100, progress.progress || 0));
-        const normalized =
-          progress.status === "loading-model"
-            ? Math.floor(raw * 0.15)
-            : 15 + Math.floor(raw * 0.85);
-        highestProgress = Math.max(highestProgress, normalized);
-        onProgress(highestProgress);
-      },
-      // Keep logs concise in GPU direct mode.
-      onLog: (message) => {
-        if (
-          message.startsWith("worker:init-start") ||
-          message.startsWith("worker:init-complete") ||
-          message.startsWith("worker:transcribe-start") ||
-          message.startsWith("worker:transcribe-running") ||
-          message.startsWith("worker:transcribe-complete") ||
-          message.startsWith("transcribe:error")
-        ) {
-          appendLocalLog(`[${fileName}] ${message}`);
-        }
-      },
-    });
+    const chunks = buildLocalChunks({ totalSamples: samples.length, sampleRate });
+    appendLocalLog(
+      `[${fileName}] chunking: ${chunks.length} chunk(s), chunk=${LOCAL_CHUNK_SECONDS}s`,
+    );
 
-    onProgress(100);
-    return {
-      text: result.text,
-      segments: result.segments.length,
+    const chunkProgress = new Map<number, number>();
+    const chunkResults = new Map<number, { text: string; segments: Array<{ text: string; start: number; end: number }> }>();
+
+    const updateOverallProgress = () => {
+      let sum = 0;
+      for (const chunk of chunks) {
+        sum += chunkProgress.get(chunk.index) ?? 0;
+      }
+      onProgress(Math.floor(sum / chunks.length));
     };
+
+    for (const chunk of chunks) {
+      if (localCancelledRef.current) throw new Error("Transcription was cancelled");
+
+      const chunkAudio = samples.subarray(chunk.startSample, chunk.endSample);
+      chunkProgress.set(chunk.index, 0);
+      appendLocalLog(`[${fileName}] GPU -> chunk ${chunk.index + 1}/${chunks.length}`);
+
+      let chunkHighest = 0;
+      const result = await service.transcribe({
+        audioData: chunkAudio,
+        language,
+        modelId,
+        sampleRate,
+        devicePreference: "webgpu",
+        returnTimestamps: true,
+        onProgress: (progress) => {
+          const raw = Math.max(0, Math.min(100, progress.progress || 0));
+          chunkHighest = Math.max(chunkHighest, raw);
+          chunkProgress.set(chunk.index, chunkHighest);
+          updateOverallProgress();
+        },
+        onLog: () => {},
+      });
+
+      const shiftedSegments = result.segments.map((segment) => ({
+        text: segment.text,
+        start: segment.start + chunk.startSeconds,
+        end: segment.end + chunk.startSeconds,
+      }));
+
+      chunkResults.set(chunk.index, { text: result.text, segments: shiftedSegments });
+      chunkProgress.set(chunk.index, 100);
+      appendLocalLog(
+        `[${fileName}] chunk ${chunk.index + 1}/${chunks.length} done (${shiftedSegments.length} segs)`,
+      );
+      updateOverallProgress();
+    }
+
+    if (localCancelledRef.current) throw new Error("Transcription was cancelled");
+
+    const mergedSegments: Array<{ text: string; start: number; end: number }> = [];
+    const orderedChunkIndexes = [...chunkResults.keys()].sort((a, b) => a - b);
+    for (const chunkIndex of orderedChunkIndexes) {
+      const chunk = chunks[chunkIndex];
+      const chunkOutput = chunkResults.get(chunkIndex);
+      if (!chunkOutput) continue;
+      for (const segment of chunkOutput.segments) {
+        if (chunkIndex > 0 && segment.end <= chunk.keepAfterSeconds + 0.01) {
+          continue;
+        }
+        mergedSegments.push(segment);
+      }
+    }
+
+    const text = mergedSegments.map((segment) => segment.text.trim()).filter(Boolean).join(" ");
+    onProgress(100);
+    return { text, segments: mergedSegments.length };
   };
 
   const startServerTranscription = async () => {
