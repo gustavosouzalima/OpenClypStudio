@@ -17,13 +17,15 @@ import {
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { cn } from "@/utils/ui";
-import { DEFAULT_LOGO_URL, SOCIAL_LINKS } from "@/constants/site-constants";
+import { SOCIAL_LINKS } from "@/constants/site-constants";
 import {
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuTrigger,
 } from "./ui/context-menu";
+
+const HEADER_LOGO_URL = "/logos/logo.svg";
 
 function useIsLoggedIn() {
   const [loggedIn, setLoggedIn] = useState(false);
@@ -80,18 +82,18 @@ export function Header() {
             <ContextMenuTrigger asChild>
               <Link href="/" className="flex items-center gap-3">
                 <Image
-                  src={DEFAULT_LOGO_URL}
+                  src={HEADER_LOGO_URL}
                   alt="OpenClyp Studio Logo"
-                  className="invert dark:invert-0"
-                  width={32}
-                  height={32}
+                  className="h-12 w-auto dark:invert"
+                  width={160}
+                  height={60}
                 />
               </Link>
             </ContextMenuTrigger>
             <ContextMenuContent>
               <ContextMenuItem
                 onClick={async () => {
-                  const res = await fetch(DEFAULT_LOGO_URL);
+                  const res = await fetch(HEADER_LOGO_URL);
                   const svg = await res.text();
                   await navigator.clipboard.writeText(svg);
                 }}
@@ -102,8 +104,8 @@ export function Header() {
               <ContextMenuItem
                 onClick={() => {
                   const a = document.createElement("a");
-                  a.href = DEFAULT_LOGO_URL;
-                  a.download = "openclyp-studio-logo.svg";
+                  a.href = HEADER_LOGO_URL;
+                  a.download = "logo.svg";
                   a.click();
                 }}
               >
@@ -145,7 +147,7 @@ export function Header() {
             <Link href={SOCIAL_LINKS.github}>
               <Button className="bg-background text-sm" variant="outline">
                 <HugeiconsIcon icon={GithubIcon} className="size-4" />
-                40k+
+                GitHub
               </Button>
             </Link>
             <Link href="/projects">

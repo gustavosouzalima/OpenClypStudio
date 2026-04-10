@@ -17,6 +17,7 @@ import { Footer } from "@/components/footer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { SOCIAL_LINKS } from "@/constants/site-constants";
 import { cn } from "@/utils/ui";
 
 export const metadata: Metadata = {
@@ -159,7 +160,7 @@ export default function HomePage() {
 									</Link>
 								</Button>
 								<Button asChild variant="outline" size="lg" className="min-w-44">
-									<Link href="/contributors">
+									<Link href={SOCIAL_LINKS.github} target="_blank" rel="noreferrer">
 										Contribute on GitHub
 										<Github className="size-4" />
 									</Link>

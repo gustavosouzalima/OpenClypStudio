@@ -2,6 +2,12 @@
 
 AI-powered video editor with automatic transcription, speaker diarization, and timeline-based editing. Designed for content creators who want to produce short-form videos from long-form content — fast.
 
+![OpenClyp Studio Screenshot](./home.jpeg)
+
+## Open Source
+
+This codebase is open source and contributions are welcome.
+
 ## What it does
 
 - **Automatic transcription** — upload audio/video or paste a YouTube URL and get word-level transcripts with speaker labels (powered by faster-whisper)
@@ -169,4 +175,4 @@ bun run backend:test       # Run backend tests (pytest)
 
 ## License
 
-Private project. All rights reserved.
+Open-source project.

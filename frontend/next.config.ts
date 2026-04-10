@@ -5,7 +5,9 @@ import path from "node:path";
 
 const nextConfig: NextConfig = {
 	turbopack: {
-		root: __dirname,
+		// Ensures Turbopack uses frontend/ as root, not the monorepo root.
+		// Required when running from the parent directory (e.g. npm run frontend:dev).
+		root: path.resolve(__dirname),
 		rules: {
 			"*.glsl": {
 				loaders: [require.resolve("raw-loader")],

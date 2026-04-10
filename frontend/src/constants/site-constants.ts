@@ -38,8 +38,9 @@ export const EXTERNAL_TOOLS: ExternalTool[] = [
 export const DEFAULT_LOGO_URL = "/logos/opencut/svg/logo.svg";
 
 export const SOCIAL_LINKS = {
-	x: "https://x.com/opencutapp",
-	github: "https://github.com/OpenCut-app/OpenCut",
+	x: "https://x.com/gudesouzalima",
+	github: "https://github.com/gustavosouzalima/OpenClypStudio",
+	instagram: "https://www.instagram.com/souzalimagustavo/",
 	discord: "https://discord.com/invite/Mu3acKZvCp",
 };
 
