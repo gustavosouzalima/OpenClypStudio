@@ -12,31 +12,70 @@ services:
       PIXEL_PORT: "8000"
       PIXEL_DATA_DIR: "/data"
       PIXEL_LOG_LEVEL: "info"
-      # PIXEL_API_KEY: "troque-esta-chave"   # opcional: protege a API do backend
+      PIXEL_API_KEY: "${PIXEL_API_KEY}"
     volumes:
       - openclyp_data:/data
-    # Não exposto ao exterior — o frontend acessa internamente pela rede Docker
     expose:
       - "8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2"
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "4711:4711"
     environment:
       NODE_ENV: "production"
       PORT: "4711"
-      NEXT_PUBLIC_SITE_URL: "${NEXT_PUBLIC_SITE_URL:-http://localhost:4711}"
-      # Aponta para o serviço backend dentro da rede Docker
+      NEXT_PUBLIC_SITE_URL: "${NEXT_PUBLIC_SITE_URL:-https://openclyp.smartiabr.com}"
       NEXT_PUBLIC_PIXEL_API_BASE_URL: "http://backend:8000"
+      NEXT_PUBLIC_PIXEL_API_KEY: "${PIXEL_API_KEY}"
       # ── Auth simples ──────────────────────────────────────────────────
       SESSION_SECRET: "${SESSION_SECRET}"        # obrigatório
       ADMIN_PASSWORD: "${ADMIN_PASSWORD}"        # obrigatório
+    expose:
+      - "4711"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4711 > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    command: caddy reverse-proxy --from openclyp.smartiabr.com --to frontend:4711
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      frontend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80 > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   openclyp_data:
+  caddy_data:
+  caddy_config:

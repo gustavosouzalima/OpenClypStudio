@@ -155,6 +155,14 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 COMPILADOS_DIR = DATA_DIR / "compilados"
 COMPILADOS_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _is_path_within_dir(path: Path, parent_dir: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent_dir.resolve())
+        return True
+    except ValueError:
+        return False
+
 # ── Job Manager ──────────────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}  # job_id → {status, progress, logs, result, error}
 _ws_queues: dict[str, asyncio.Queue] = {}  # job_id → asyncio.Queue
@@ -1339,6 +1347,7 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
     history_ids: list[str] = []
     generated_temp_files: list[str] = []
     saved_outputs: list[str] = []
+    source_files_to_cleanup: list[str] = []
 
     try:
         total_files = max(len(req.files), 1)
@@ -1358,6 +1367,10 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
 
             if not source_path.exists():
                 raise RuntimeError(f"File not found: {source_path}")
+
+            # Auto-clean original uploads after successful transcription.
+            if _is_path_within_dir(source_path, UPLOAD_DIR):
+                source_files_to_cleanup.append(str(source_path))
 
             if not str(source_path).lower().endswith(".wav"):
                 log("🔄 Converting to WAV...")
@@ -1467,6 +1480,13 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
                 os.remove(temp_file)
             except OSError:
                 pass
+
+        if _jobs[job_id].get("status") == "done":
+            for source_file in dict.fromkeys(source_files_to_cleanup):
+                try:
+                    os.remove(source_file)
+                except OSError:
+                    pass
         gc.collect()
 
 
