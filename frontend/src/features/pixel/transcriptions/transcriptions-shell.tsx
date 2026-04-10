@@ -483,6 +483,9 @@ export function PixelTranscriptionsShell() {
           segments: shiftedSegments,
         });
         chunkProgress.set(chunk.index, 100);
+        appendLocalLog(
+          `[${fileName}] worker-${workerIndex + 1} chunk ${chunk.index + 1}/${chunks.length} done (${shiftedSegments.length} segs)`,
+        );
         updateOverallProgress();
       }
     };
@@ -513,6 +516,9 @@ export function PixelTranscriptionsShell() {
     }
 
     const text = mergedSegments.map((segment) => segment.text.trim()).filter(Boolean).join(" ");
+    if (!text.trim()) {
+      appendLocalLog(`WARNING: transcription produced empty text (${mergedSegments.length} segments). Try CPU mode or a different model.`);
+    }
     return {
       text,
       segments: mergedSegments.length,
@@ -621,8 +627,9 @@ export function PixelTranscriptionsShell() {
 
       chunkResults.set(chunk.index, { text: result.text, segments: shiftedSegments });
       chunkProgress.set(chunk.index, 100);
+      const chunkTextPreview = result.text.trim().slice(0, 80);
       appendLocalLog(
-        `[${fileName}] chunk ${chunk.index + 1}/${chunks.length} done (${shiftedSegments.length} segs)`,
+        `[${fileName}] chunk ${chunk.index + 1}/${chunks.length} done (${shiftedSegments.length} segs${chunkTextPreview ? `, text="${chunkTextPreview}..."` : ", EMPTY"})`,
       );
       updateOverallProgress();
     }
@@ -644,6 +651,9 @@ export function PixelTranscriptionsShell() {
     }
 
     const text = mergedSegments.map((segment) => segment.text.trim()).filter(Boolean).join(" ");
+    if (!text.trim()) {
+      appendLocalLog(`WARNING: GPU transcription produced empty text (${mergedSegments.length} segments). WebGPU may not be fully supported. Try CPU mode.`);
+    }
     onProgress(100);
     return { text, segments: mergedSegments.length };
   };
@@ -758,6 +768,21 @@ export function PixelTranscriptionsShell() {
         updateLocalProgress(Math.floor(((index + 1) / totalFiles) * 100));
         appendLocalLog(`Completed ${file.name} (${perFileResult.segments} segments)`);
       }
+    } catch (err) {
+      appendLocalLog(`Transcription failed: ${err instanceof Error ? err.message : String(err)}`);
+      setActiveJob((current) =>
+        current
+          ? {
+              ...current,
+              status: "error",
+              progress: Math.max(current.progress, 1),
+              error: err instanceof Error ? err.message : String(err),
+            }
+          : current,
+      );
+      setIsTranscribing(false);
+      markTranscriptionFinished();
+      return;
     } finally {
       if (sharedGpuService) {
         sharedGpuService.terminate();
