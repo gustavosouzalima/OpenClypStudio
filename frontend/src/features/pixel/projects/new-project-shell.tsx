@@ -184,7 +184,7 @@ export function NewProjectShell() {
 	const fileInputRef = useRef<HTMLInputElement>(null);
 
 	// Step 3 (AI only): Transcription config
-	const [model, setModel] = useState("large-v3-turbo");
+	const [model, setModel] = useState("small");
 	const [language, setLanguage] = useState("auto");
 	const [beamSize, setBeamSize] = useState(1);
 

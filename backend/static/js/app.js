@@ -99,10 +99,10 @@ document.addEventListener('alpine:init', () => {
   // ── Centralized Settings ───────────────────────────────────────────────────
   const DEFAULT_SETTINGS = {
     whisper: {
-      model: 'large-v3-turbo',
+      model: 'small',
       language: 'pt',
-      beam_size: 5,
-      batch_size: 32,
+      beam_size: 1,
+      batch_size: 16,
       diarize: false,
       num_speakers: 2,
       auto_detect_speakers: false,

@@ -118,10 +118,10 @@ export function PixelTranscriptionsShell() {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [config, setConfig] = useState<PixelTranscriptionRequest>({
-    model: "large-v3-turbo",
+    model: "small",
     language: "auto",
     beam_size: 1,
-    batch_size: 32,
+    batch_size: 16,
     diarize: false,
     num_speakers: 2,
     auto_detect_speakers: false,

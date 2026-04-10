@@ -340,7 +340,7 @@ export const pixelApi = {
     request<{ job_id: string }>(`/api/projects/${projectId}/process`, {
       method: "POST",
       body: JSON.stringify({
-        model: payload.model ?? "large-v3-turbo",
+        model: payload.model ?? "small",
         language: payload.language ?? "auto",
         beam_size: payload.beam_size ?? 1,
         diarize: payload.diarize ?? false,
@@ -512,10 +512,10 @@ export const pixelApi = {
   } = {}) => {
     const formData = new FormData();
     formData.append("audio_file", audioBlob, "editor_audio.wav");
-    formData.append("model", config.model ?? "large-v3-turbo");
+    formData.append("model", config.model ?? "small");
     formData.append("language", config.language ?? "auto");
     formData.append("beam_size", String(config.beam_size ?? 1));
-    formData.append("batch_size", String(config.batch_size ?? 32));
+    formData.append("batch_size", String(config.batch_size ?? 16));
 
     const response = await fetch(`${PIXEL_API_BASE_URL}/api/editor/transcribe`, {
       method: "POST",

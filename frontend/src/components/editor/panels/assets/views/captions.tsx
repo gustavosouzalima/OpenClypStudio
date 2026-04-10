@@ -301,10 +301,10 @@ export function Captions() {
 
 			// Call Python backend for transcription
 			const result = await pixelApi.transcribeEditorAudio(audioBlob, {
-				model: "large-v3-turbo",
+				model: "small",
 				language: selectedLanguage === "auto" ? "auto" : selectedLanguage,
 				beam_size: 1,
-				batch_size: 32,
+				batch_size: 16,
 			});
 
 			if (!result || !result.segments || result.segments.length === 0) {

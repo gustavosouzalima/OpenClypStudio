@@ -128,10 +128,10 @@ export async function POST(request: Request) {
 
     const formData = new FormData();
     formData.append("audio_file", fileBlob, `editor-media${extension}`);
-    formData.append("model", body.model || "large-v3-turbo");
+    formData.append("model", body.model || "small");
     formData.append("language", (body.targetLanguage || "auto").toLowerCase());
     formData.append("beam_size", String(body.beam_size ?? 1));
-    formData.append("batch_size", String(body.batch_size ?? 32));
+    formData.append("batch_size", String(body.batch_size ?? 16));
 
     const pythonResponse = await fetch(
       `${getPixelApiBaseUrl()}/api/editor/transcribe`,

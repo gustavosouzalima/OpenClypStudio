@@ -186,9 +186,9 @@ export function PixelProjectDetailShell({
 
 	// Transcription config
 	const [showProcessConfig, setShowProcessConfig] = useState(false);
-	const [processModel, setProcessModel] = useState("large-v3-turbo");
+	const [processModel, setProcessModel] = useState("small");
 	const [processLanguage, setProcessLanguage] = useState("auto");
-	const [processBeamSize, setProcessBeamSize] = useState(5);
+	const [processBeamSize, setProcessBeamSize] = useState(1);
 	const [processDiarize, setProcessDiarize] = useState(false);
 
 	const loadProject = async () => {
