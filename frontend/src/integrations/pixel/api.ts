@@ -500,6 +500,14 @@ export const pixelApi = {
       method: "POST",
       body: JSON.stringify(recording),
     }),
+  saveTextTranscription: (text: {
+    filename: string;
+    content: string;
+  }) =>
+    request<PixelHistoryItem>("/api/history/text", {
+      method: "POST",
+      body: JSON.stringify(text),
+    }),
   /**
    * Transcribe audio from the OpenCut editor timeline.
    * Accepts a WAV audio blob and returns transcription segments for caption generation.

@@ -358,57 +358,17 @@ except ValueError:
 
 
 def _mp_init_worker(model_name: str):
-    global _mp_batched
+    global _mp_batched, _mp_model
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     import transcription as _tr
     _tr._model_cache.pop(model_name, None)
     _tr._batched_cache.pop(model_name, None)
-    _, _mp_batched = _tr.get_whisper_model(model_name)
+    _mp_model, _mp_batched = _tr.get_whisper_model(model_name)
 
 
 _mp_batched = None
-_NO_CLIP_TIMESTAMPS_ERR = "No clip timestamps found"
-
-
-def _call_batched_transcribe_with_vad_retry(
-    batched,
-    *,
-    chunk_path: str,
-    language: str | None,
-    beam_size: int,
-    batch_size: int,
-    vad_filter: bool,
-):
-    """Run batched.transcribe with one safe fallback for missing clip timestamps.
-
-    Some faster-whisper versions can raise:
-    "No clip timestamps found. Set 'vad_filter' to True or provide 'clip_timestamps'."
-    when VAD is disabled. In that case we retry once with VAD enabled.
-    """
-    kwargs = dict(
-        language=language,
-        beam_size=beam_size,
-        batch_size=batch_size,
-        condition_on_previous_text=False,
-    )
-
-    try:
-        return batched.transcribe(
-            chunk_path,
-            vad_filter=vad_filter,
-            vad_parameters=dict(min_silence_duration_ms=500) if vad_filter else None,
-            **kwargs,
-        )
-    except Exception as exc:
-        if vad_filter or _NO_CLIP_TIMESTAMPS_ERR not in str(exc):
-            raise
-        return batched.transcribe(
-            chunk_path,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            **kwargs,
-        )
+_mp_model = None
 
 
 def _mp_transcribe_one(args: tuple) -> tuple:
@@ -416,14 +376,24 @@ def _mp_transcribe_one(args: tuple) -> tuple:
     if _mp_cancel_event and _mp_cancel_event.is_set():
         return (chunk_index, [], None, None)
     try:
-        segments_gen, info = _call_batched_transcribe_with_vad_retry(
-            _mp_batched,
-            chunk_path=chunk_path,
+        kwargs = dict(
             language=language,
             beam_size=beam_size,
             batch_size=batch_size,
-            vad_filter=vad_filter,
+            condition_on_previous_text=False,
         )
+        if vad_filter:
+            segments_gen, info = _mp_batched.transcribe(
+                chunk_path,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+                **kwargs,
+            )
+        else:
+            segments_gen, info = _mp_model.transcribe(
+                chunk_path,
+                **kwargs,
+            )
         detected = getattr(info, "language", None)
         segments = []
         for seg in segments_gen:
@@ -474,6 +444,7 @@ def _shutdown_mp_pool():
 
 
 def _transcribe_single_chunk(
+    model,
     batched,
     chunk_path: str,
     chunk_offset: float,
@@ -483,15 +454,24 @@ def _transcribe_single_chunk(
     batch_size: int,
     vad_filter: bool = True,
 ) -> tuple[list, str | None]:
-    """Transcribe one audio chunk. Safe to call from a ThreadPoolExecutor."""
-    segments_gen, info = _call_batched_transcribe_with_vad_retry(
-        batched,
-        chunk_path=chunk_path,
+    kwargs = dict(
         language=language,
         beam_size=beam_size,
         batch_size=batch_size,
-        vad_filter=vad_filter,
+        condition_on_previous_text=False,
     )
+    if vad_filter:
+        segments_gen, info = batched.transcribe(
+            chunk_path,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+            **kwargs,
+        )
+    else:
+        segments_gen, info = model.transcribe(
+            chunk_path,
+            **kwargs,
+        )
     detected = getattr(info, "language", None)
     segments = []
     for seg in segments_gen:
@@ -507,6 +487,7 @@ def _transcribe_single_chunk(
 
 def _transcribe_with_optional_chunking(
     *,
+    model,
     batched,
     model_name: str = "",
     audio_path: str,
@@ -547,7 +528,7 @@ def _transcribe_with_optional_chunking(
             log_fn(f"[mem] RSS before transcribe: {_rss_mb()}")
             log_fn(f"   Transcribing (beam={beam_size}, batch={batch_size})...")
         segs, detected = _transcribe_single_chunk(
-            batched, chunks[0][0], chunks[0][1], 0,
+            model, batched, chunks[0][0], chunks[0][1], 0,
             language, beam_size, batch_size, vad_filter,
         )
         if progress_fn:
@@ -615,7 +596,7 @@ def _transcribe_with_optional_chunking(
                     break
                 future = pool.submit(
                     _transcribe_single_chunk,
-                    batched, chunk_path, chunk_offset, chunk_index,
+                    model, batched, chunk_path, chunk_offset, chunk_index,
                     language, beam_size, batch_size, vad_filter,
                 )
                 futures[future] = chunk_index
@@ -1504,6 +1485,23 @@ async def save_recording_to_history(req: SaveRecordingRequest):
         "size_bytes": os.path.getsize(req.filepath),
     }
 
+class SaveTextTranscriptionRequest(BaseModel):
+    filename: str
+    content: str
+
+
+@app.post("/api/history/text", status_code=201)
+async def save_text_transcription(req: SaveTextTranscriptionRequest, _: None = Depends(_require_api_key)):
+    record_id = history.save_text(req.filename, req.content)
+    item = history.get(record_id)
+    return {
+        "id": record_id,
+        "filename": item.get("filename", req.filename),
+        "filepath": item.get("filepath", ""),
+        "created_at": item.get("created_at", "") if item else "",
+        "size_bytes": item.get("size_bytes", 0) if item else 0,
+    }
+
 # ── Editor Transcription (converged captions) ────────────────────────────────────────
 
 class EditorTranscriptionSegment(BaseModel):
@@ -1588,7 +1586,7 @@ async def transcribe_editor_audio(
         model_name, effective_batch_size = _resolve_transcribe_runtime(model, batch_size)
 
         # Load Whisper model
-        _, batched = tr_module.get_whisper_model(model_name, None)
+        model, batched = tr_module.get_whisper_model(model_name, None)
         if not batched:
             raise HTTPException(
                 status_code=500,
@@ -1597,6 +1595,7 @@ async def transcribe_editor_audio(
 
         # Transcribe (with chunking for long media)
         segments_list_raw, detected_language, temp_chunk_files = _transcribe_with_optional_chunking(
+            model=model,
             batched=batched,
             model_name=model_name,
             audio_path=audio_path,
@@ -1926,7 +1925,7 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
         language = None if req.language == "auto" else req.language
 
         log(f"Loading Whisper model '{model_name}' (batch={effective_batch_size}, chunk={TRANSCRIBE_CHUNK_SECONDS}s)...")
-        _, batched = tr_module.get_whisper_model(model_name, log)
+        model, batched = tr_module.get_whisper_model(model_name, log)
         if not batched:
             raise RuntimeError("Failed to load Whisper model.")
         log(f"[mem] RSS after model load: {_rss_mb()}")
@@ -1961,6 +1960,7 @@ def _run_transcribe_files(job_id: str, req: TranscribeRequest, loop: asyncio.Abs
             progress(max(1, file_progress_start + 5))
 
             segments_list, detected_language, chunk_temp_files = _transcribe_with_optional_chunking(
+                model=model,
                 batched=batched,
                 model_name=model_name,
                 audio_path=audio_path,
@@ -2136,12 +2136,13 @@ def _run_transcribe_url(job_id: str, req: TranscribeUrlRequest, loop: asyncio.Ab
         log(f"🎤 Loading model '{model_name}' (batch={effective_batch_size}, chunk={TRANSCRIBE_CHUNK_SECONDS}s)...")
         progress(30)
 
-        _, batched = tr_module.get_whisper_model(model_name, log)
+        model, batched = tr_module.get_whisper_model(model_name, log)
         if not batched:
             raise RuntimeError("Failed to load Whisper model.")
         log(f"[mem] RSS after model load: {_rss_mb()}")
 
         segments_list, detected_language, chunk_temp_files = _transcribe_with_optional_chunking(
+            model=model,
             batched=batched,
             model_name=model_name,
             audio_path=audio_path,
@@ -3431,7 +3432,7 @@ def _run_project_process(
 
         total = len(videos)
         model_name, effective_batch_size = _resolve_transcribe_runtime(req.model, req.batch_size, log)
-        _, batched = tr_module.get_whisper_model(model_name, log)
+        model, batched = tr_module.get_whisper_model(model_name, log)
         if not batched:
             raise RuntimeError("Nao foi possivel carregar o modelo Whisper.")
 
@@ -3516,6 +3517,7 @@ def _run_project_process(
                 language = None if req.language == "auto" else req.language
 
                 segments_list, detected_language, chunk_temp_files = _transcribe_with_optional_chunking(
+                    model=model,
                     batched=batched,
                     model_name=model_name,
                     audio_path=audio_path,

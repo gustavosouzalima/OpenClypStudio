@@ -125,5 +125,25 @@ def delete_many(record_ids: list[str], db_path: str = DB_PATH) -> int:
         return cursor.rowcount if cursor.rowcount is not None else 0
 
 
+def save_text(filename: str, content: str, db_path: str = DB_PATH) -> str:
+    record_id = str(uuid.uuid4())
+    safe_name = "".join(c for c in filename if c.isalnum() or c in " -_.")[:120] or f"transcription_{record_id[:8]}"
+    out_dir = os.path.join(os.path.dirname(db_path), "transcriptions")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{safe_name}.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    size = os.path.getsize(out_path)
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO transcriptions (id, filename, filepath, created_at, size_bytes) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (record_id, safe_name, out_path,
+             datetime.now().isoformat(timespec="microseconds"), size),
+        )
+        conn.commit()
+    return record_id
+
+
 # Inicializa DB ao importar
 init_db()

@@ -698,17 +698,28 @@ export function PixelTranscriptionsShell() {
     const mergedContent = outputParts.join("\n\n---\n\n");
     const filename =
       selectedFiles.length === 1
-        ? `${selectedFiles[0].name}.txt`
+        ? `${selectedFiles[0].name}_transcription.txt`
         : `local-transcription-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
 
     setLocalTranscript({ filename, content: mergedContent });
+
+    const historyIds: string[] = [];
+    try {
+      appendLocalLog("Saving transcription to backend history...");
+      const saved = await pixelApi.saveTextTranscription({ filename, content: mergedContent });
+      historyIds.push(saved.id);
+      appendLocalLog(`Saved to history (id=${saved.id})`);
+    } catch (err) {
+      appendLocalLog(`Failed to save to history: ${err}`);
+    }
+
     setActiveJob((current) =>
       current
         ? {
             ...current,
             status: "done",
             progress: 100,
-            result: { history_ids: [], files: [] },
+            result: { history_ids: historyIds, files: [] },
           }
         : current,
     );
